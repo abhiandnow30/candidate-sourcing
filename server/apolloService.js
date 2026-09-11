@@ -302,7 +302,10 @@ function searchBody(filters, page, perPage, verifiedEmailOnly) {
   // express anyway.
   const locations = splitList(filters.location);
   if (locations.length) body.person_locations = locations;
-  if (filters.seniority) body.person_seniorities = [filters.seniority];
+  // Several levels are an OR at Apollo, like titles and locations: a hire that
+  // could be senior or manager is one search, not two.
+  const seniorities = splitList(filters.seniority);
+  if (seniorities.length) body.person_seniorities = seniorities;
   // organization_names is accepted but does nothing: measured against the live
   // API, a real company, another real company and a nonsense string all
   // returned the identical count to sending no filter at all. It is kept only

@@ -104,7 +104,7 @@ async function searchWith(people, enrich, reveal, waterfall, poll) {
   mockBackend({ search: () => searchResult(people), enrich, reveal, waterfall, poll });
   render(<App />);
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   for (const person of people) await screen.findByText(person.name);
 }
 
@@ -112,11 +112,44 @@ function rowFor(name) {
   return screen.getByText(name).closest('.candidate-block');
 }
 
-// Role, skills and location are required, so every search scenario sets them.
-function fillRequired({ jobTitle = 'java developer', location = 'delhi', keywords = 'java' } = {}) {
+// A role or a skill is all a search needs, but most scenarios here describe a
+// full query, so all three are filled by default.
+function fillRequired({ jobTitle = 'java developer', keywords = 'java' } = {}) {
   fireEvent.change(screen.getByLabelText(/role \/ job title/i), { target: { value: jobTitle } });
-  fireEvent.change(screen.getByLabelText(/^location/i), { target: { value: location } });
   fireEvent.change(screen.getByLabelText(/^skills$/i), { target: { value: keywords } });
+}
+
+// Location is not typed: it is a list of the cities the last search returned,
+// ticked on and off. This ticks one by its visible name.
+function tickLocation(city) {
+  fireEvent.click(screen.getByRole('checkbox', { name: new RegExp(`^${city}`, 'i') }));
+}
+
+// There is no Search button: a filter applies the moment it is committed, and
+// Enter in the role box is how a recruiter commits a typed one.
+function applySearch() {
+  fireEvent.keyDown(screen.getByLabelText(/role \/ job title/i), { key: 'Enter' });
+}
+
+// Select all is gone: on a pool of millions it offered to tick 25 arbitrary
+// rows. Tests that used it tick every selectable row instead, which is the same
+// thing it did.
+function selectEveryRow() {
+  for (const box of screen.getAllByRole('checkbox', { name: /^select /i })) {
+    if (!box.disabled && !box.checked) fireEvent.click(box);
+  }
+}
+
+// The app opens on the whole pool, so every render already spent one search
+// before the test did anything. Counting requests means counting from here.
+function opened() {
+  expect(calls.length).toBeGreaterThan(0);
+  return calls.length;
+}
+
+// The searches a test itself caused, with the opening one left out.
+function searchCalls() {
+  return calls.filter((call) => call.url === '/api/candidates/search').slice(1);
 }
 
 function selectionCount() {
@@ -136,7 +169,57 @@ test('search renders candidates returned by our backend', async () => {
   expect(calls[0].url).toBe('/api/candidates/search');
   expect(screen.getByText('Test Candidate')).toBeTruthy();
   expect(screen.getByText('Other Candidate')).toBeTruthy();
-  expect(within(rowFor('Test Candidate')).getByText('Not enriched')).toBeTruthy();
+  // Nothing claims a state the row has not reached: no badge, and no details
+  // to open.
+  expect(within(rowFor('Test Candidate')).queryByText(/enriched/i)).toBeNull();
+  expect(within(rowFor('Test Candidate')).queryByRole('button', { name: /view details/i })).toBeNull();
+});
+
+test('clicking anywhere on a row selects it, and clicking again lets it go', async () => {
+  await searchWith([bareCandidate('person-1', 'Test Candidate')]);
+  const row = rowFor('Test Candidate').querySelector('.candidate-row');
+
+  fireEvent.click(row);
+  expect(screen.getByRole('checkbox', { name: /select test candidate/i }).checked).toBe(true);
+  expect(selectionCount()).toMatch(/1/);
+
+  fireEvent.click(row);
+  expect(screen.getByRole('checkbox', { name: /select test candidate/i }).checked).toBe(false);
+});
+
+test('a link inside a row is a link, not a way to select the row', async () => {
+  await searchWith([{ ...bareCandidate('person-1', 'Test Candidate'), linkedinUrl: 'https://www.linkedin.com/in/example' }]);
+  const row = rowFor('Test Candidate');
+
+  fireEvent.click(within(row).getByRole('link', { name: /view linkedin profile/i }));
+  expect(screen.getByRole('checkbox', { name: /select test candidate/i }).checked).toBe(false);
+});
+
+test('a row Apollo gave no person ID for cannot be selected by clicking it', async () => {
+  await searchWith([{ ...bareCandidate(null, 'Anonymous Result'), id: null }]);
+  fireEvent.click(rowFor('Anonymous Result').querySelector('.candidate-row'));
+  expect(screen.getByRole('checkbox', { name: /cannot select/i }).checked).toBe(false);
+  expect(selectionCount()).toMatch(/0/);
+});
+
+test('a candidate the backend already holds arrives enriched, ready to open', async () => {
+  // The credit was spent on some earlier search, so the row does not ask for it
+  // again: it offers the details straight away.
+  mockBackend({
+    search: () => searchResult([{
+      ...enrichedCandidate('person-1', 'Test Candidate'), enriched: true, fromCache: true
+    }])
+  });
+  render(<App />);
+  await screen.findByText('Test Candidate');
+
+  const row = rowFor('Test Candidate');
+  expect(within(row).getByText('Enriched')).toBeTruthy();
+  fireEvent.click(within(row).getByRole('button', { name: /show enriched details/i }));
+
+  // And the details are there without a single request beyond the search.
+  expect(await detailsPanel('Test Candidate')).toBeTruthy();
+  expect(calls.every((call) => call.url === '/api/candidates/search')).toBe(true);
 });
 
 test('an individual candidate can be selected and deselected', async () => {
@@ -154,7 +237,7 @@ test('Select all and Clear act on every candidate', async () => {
   // Only the per-candidate checkboxes; the results toolbar has its own filter
   // checkbox, which Select all must leave alone.
   const rowBoxes = () => screen.getAllByRole('checkbox', { name: /^select /i });
-  fireEvent.click(screen.getByRole('button', { name: /select all/i }));
+  selectEveryRow();
   for (const checkbox of rowBoxes()) expect(checkbox.checked).toBe(true);
   fireEvent.click(screen.getByRole('button', { name: /^clear$/i }));
   for (const checkbox of rowBoxes()) expect(checkbox.checked).toBe(false);
@@ -182,7 +265,7 @@ test('enriched Apollo details render inside our UI, not on LinkedIn', async () =
 
   await screen.findByText(/enrichment complete/i);
   const row = rowFor('Test Candidate');
-  expect(within(row).getByText('Yes')).toBeTruthy();
+  expect(within(row).getByText('Enriched')).toBeTruthy();
 
   // Enrichment auto-opens the panel: the recruiter already asked for this data.
   const details = await detailsPanel('test candidate');
@@ -245,11 +328,11 @@ test('partial enrichment updates the matches and marks the failure retryable', a
       skippedIds: []
     })
   );
-  fireEvent.click(screen.getByRole('button', { name: /select all/i }));
+  selectEveryRow();
   fireEvent.click(screen.getByRole('button', { name: /enrich selected/i }));
 
   await screen.findByText(/unable to enrich this candidate/i);
-  expect(within(rowFor('Matched Candidate')).getByText('Yes')).toBeTruthy();
+  expect(within(rowFor('Matched Candidate')).getByText('Enriched')).toBeTruthy();
   const failedRow = rowFor('Unmatched Candidate');
   expect(within(failedRow).getByText('Enrichment failed')).toBeTruthy();
   // The candidate stays in the results and can be retried.
@@ -307,7 +390,7 @@ test('the enrich button is disabled and labelled while enrichment runs', async (
 
   render(<App />);
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   await screen.findByText('Test Candidate');
   fireEvent.click(screen.getByRole('checkbox', { name: /select test candidate/i }));
   fireEvent.click(screen.getByRole('button', { name: /enrich selected/i }));
@@ -338,7 +421,9 @@ test('a result with no Apollo person ID cannot be selected for enrichment', asyn
   await searchWith([{ ...bareCandidate(null, 'Anonymous Result'), id: null }]);
   const checkbox = screen.getByRole('checkbox', { name: /cannot select/i });
   expect(checkbox.disabled).toBe(true);
-  fireEvent.click(screen.getByRole('button', { name: /select all/i }));
+  // Nothing offers to tick it: a row Apollo gave no person ID for cannot be
+  // enriched, so it cannot be selected either.
+  expect(screen.queryAllByRole('checkbox', { name: /^select / })).toHaveLength(0);
   expect(checkbox.checked).toBe(false);
 });
 
@@ -349,13 +434,16 @@ test('an unreachable backend reads as a retry message, not a JSON parse error', 
   });
   render(<App />);
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
 
   const notice = await screen.findByText(/not reachable right now/i);
   expect(notice).toBeTruthy();
   expect(notice.textContent).not.toMatch(/JSON/i);
-  // The button recovers so the recruiter can retry once the backend is back.
-  expect(screen.getByRole('button', { name: /search candidates/i }).disabled).toBe(false);
+  // The form recovers, so committing a filter again retries once the backend
+  // is back rather than leaving the recruiter stuck on the notice.
+  const before = calls.length;
+  applySearch();
+  expect(calls.length).toBeGreaterThan(before);
 });
 
 test('a JSON error body from our backend is shown verbatim', async () => {
@@ -365,7 +453,7 @@ test('a JSON error body from our backend is shown verbatim', async () => {
   });
   render(<App />);
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   expect(await screen.findByText('Apollo API rate limit reached. Please try again later.')).toBeTruthy();
 });
 
@@ -376,7 +464,7 @@ test('an empty 200 body reads as an empty response, not a parse error', async ()
   });
   render(<App />);
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   const notice = await screen.findByText(/empty response/i);
   expect(notice.textContent).not.toMatch(/JSON/i);
 });
@@ -399,35 +487,43 @@ test('the details panel can be collapsed again after enrichment', async () => {
 test('pressing Enter in a filter field runs the search', async () => {
   mockBackend({ search: () => searchResult([bareCandidate('person-1', 'Test Candidate')]) });
   render(<App />);
-  fillRequired();
-  fireEvent.submit(screen.getByLabelText(/role \/ job title/i).closest('form'));
+  // The opening search asks for nothing in particular: the pool as it stands.
   await screen.findByText('Test Candidate');
   expect(calls[0].url).toBe('/api/candidates/search');
-  expect(calls[0].body.jobTitle).toBe('java developer');
-  expect(calls[0].body.location).toBe('delhi');
-  expect(calls[0].body.keywords).toBe('java');
+  expect(calls[0].body.jobTitle).toBe('');
+
+  fillRequired();
+  fireEvent.submit(screen.getByLabelText(/role \/ job title/i).closest('form'));
+  await waitFor(() => expect(searchCalls().length).toBe(1));
+  const sent = searchCalls()[0].body;
+  expect(sent.jobTitle).toBe('java developer');
+  expect(sent.keywords).toBe('java');
+  // Nothing stands in for a location that was never picked.
+  expect(sent.location).toBe('');
 });
 
-test('Reset filters clears every field without searching', async () => {
-  mockBackend({});
+test('Reset filters clears every field', async () => {
+  mockBackend({ search: () => searchResult([]) });
   render(<App />);
+  const start = opened();
   const jobTitle = screen.getByLabelText(/role \/ job title/i);
-  const location = screen.getByLabelText(/^location/i);
+  const skills = screen.getByLabelText(/^skills$/i);
   fireEvent.change(jobTitle, { target: { value: 'java developer' } });
-  fireEvent.change(location, { target: { value: 'delhi' } });
+  fireEvent.change(skills, { target: { value: 'java' } });
   expect(jobTitle.value).toBe('java developer');
 
-  fireEvent.click(screen.getByRole('button', { name: /reset filters/i }));
+  fireEvent.click(screen.getByRole('button', { name: /reset all/i }));
   expect(jobTitle.value).toBe('');
-  expect(location.value).toBe('');
-  expect(calls.length).toBe(0);
+  expect(skills.value).toBe('');
+  // Typing never searched, and clearing what was typed does not either.
+  expect(calls.length).toBe(start);
 });
 
 test('pagination shows the page count and stops at the last page', async () => {
   mockBackend({ search: () => ({ candidates: [bareCandidate('person-1', 'Test Candidate')], page: 1, perPage: 25, total: 1383 }) });
   render(<App />);
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   await screen.findByText('Test Candidate');
   // 1383 results at 25 per page is 56 pages.
   expect(screen.getByText(/of 56/)).toBeTruthy();
@@ -440,10 +536,12 @@ test('the results header reports this page against the Apollo total', async () =
   mockBackend({ search: () => ({ candidates: people, page: 1, perPage: 25, total: 1383 }) });
   render(<App />);
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   await screen.findByText('Candidate 0');
-  // One count, in one place, right above the rows it describes.
-  expect(screen.getByText('Showing 25 of 1,383 profiles')).toBeTruthy();
+  // One count, in one place, right above the rows it describes: the size of
+  // the pool, not a restatement of how many rows fit on a page.
+  expect(screen.getByText('1,383 profiles')).toBeTruthy();
+  expect(screen.queryByText(/showing 25 of/i)).toBeNull();
   expect(screen.queryByText(/source with intent/i)).toBeNull();
   expect(screen.queryByText(/behind the potential/i)).toBeNull();
 });
@@ -463,39 +561,50 @@ test('the header and each row have the same number of grid cells', async () => {
   const rowCells = document.querySelectorAll('.candidate-row > *').length;
   // A mismatch here means the CSS grid columns no longer line up with the
   // header labels, which silently shifts every value under the wrong heading.
-  expect(headCells).toBe(6);
+  expect(headCells).toBe(5);
   expect(rowCells).toBe(headCells);
 });
 
-test('searching needs a location and either a role or a skill', async () => {
-  mockBackend({});
+test('the app opens on the pool, and each filter narrows the same query', async () => {
+  mockBackend({ search: () => searchResult([bareCandidate('person-1', 'Test Candidate')]) });
   render(<App />);
-  const button = screen.getByRole('button', { name: /search candidates/i });
-  expect(button.disabled).toBe(true);
-  expect(screen.getByText(/a location is required, along with a role or at least one skill/i)).toBeTruthy();
+  // The pool is on screen before anything is asked of it.
+  await screen.findByText('Test Candidate');
+  expect(calls[0].body.jobTitle).toBe('');
+  expect(calls[0].body.location).toBe('');
 
-  // A role on its own is not enough without somewhere to look.
+  // A role on its own is a search Apollo answers perfectly well.
   fireEvent.change(screen.getByLabelText(/role \/ job title/i), { target: { value: 'java developer' } });
-  expect(button.disabled).toBe(true);
-  fireEvent.change(screen.getByLabelText(/^location/i), { target: { value: 'delhi' } });
-  // Role plus location is a complete search: skills are no longer compulsory.
-  expect(button.disabled).toBe(false);
+  applySearch();
+  await waitFor(() => expect(searchCalls().length).toBe(1));
+  expect(searchCalls()[0].body.jobTitle).toBe('java developer');
 
-  // And so is a skill plus location, with no role at all.
+  // Ticking a city narrows that same query rather than starting a new one.
+  tickLocation('Hyderabad');
+  await waitFor(() => expect(searchCalls().length).toBe(2));
+  expect(searchCalls()[1].body.location).toBe('Hyderabad');
+  expect(searchCalls()[1].body.jobTitle).toBe('java developer');
+
+  // And a skill with no role at all is a search too.
   fireEvent.change(screen.getByLabelText(/role \/ job title/i), { target: { value: '' } });
-  expect(button.disabled).toBe(true);
   fireEvent.change(screen.getByLabelText(/^skills$/i), { target: { value: 'java' } });
-  expect(button.disabled).toBe(false);
-  expect(screen.queryByText(/still needed/i)).toBeNull();
-  expect(calls.length).toBe(0);
+  fireEvent.keyDown(screen.getByLabelText(/^skills$/i), { key: 'Enter' });
+  await waitFor(() => expect(searchCalls().length).toBe(3));
+  expect(searchCalls()[2].body.keywords).toMatch(/java/);
+  expect(searchCalls()[2].body.jobTitle).toBe('');
 });
 
-test('the optional filters alone are not enough to search', async () => {
-  mockBackend({});
+test('a filter on its own narrows the open pool rather than being refused', async () => {
+  mockBackend({ search: () => searchResult([]) });
   render(<App />);
-  fireEvent.change(screen.getByLabelText(/seniority/i), { target: { value: 'senior' } });
-  expect(screen.getByRole('button', { name: /search candidates/i }).disabled).toBe(true);
-  expect(calls.length).toBe(0);
+  opened();
+
+  // Seniority cannot describe a pool, but there already is one, so it narrows
+  // that instead of being turned away for having no role beside it.
+  fireEvent.click(screen.getByRole('checkbox', { name: /^senior$/i }));
+  await waitFor(() => expect(searchCalls().length).toBe(1));
+  expect(searchCalls()[0].body.seniority).toBe('senior');
+  expect(searchCalls()[0].body.jobTitle).toBe('');
 });
 
 test('the filters Apollo cannot honour are not offered', async () => {
@@ -508,49 +617,55 @@ test('the filters Apollo cannot honour are not offered', async () => {
   expect(screen.queryByLabelText(/^company/i)).toBeNull();
   expect(screen.queryByLabelText(/^industry/i)).toBeNull();
 
-  // Read from the fields themselves rather than label text, which also carries
-  // the picker toggles and the seniority options.
-  const names = [...document.querySelectorAll('.form-grid input, .form-grid select')]
+  // Four filters and no more: two boxes and two lists of ticks.
+  expect(screen.getByLabelText(/role \/ job title/i)).toBeTruthy();
+  expect(screen.getByLabelText(/^skills$/i)).toBeTruthy();
+  expect(screen.getByText('Location')).toBeTruthy();
+  expect(screen.getByText('Seniority')).toBeTruthy();
+  // Four filters and nothing else that types: the role, the skills box, and
+  // the box that adds a city the standing list does not hold.
+  const typed = [...document.querySelectorAll('.filter-form input:not([type="checkbox"]), .filter-form select')]
     .map((field) => field.name);
-  expect(names).toEqual(['jobTitle', 'location', 'keywords', 'seniority']);
+  expect(typed).toEqual(['jobTitle', 'location', 'keywords']);
 });
 
-test('whitespace does not satisfy a required filter', async () => {
-  mockBackend({});
+test('whitespace is not a filter, however it is committed', async () => {
+  mockBackend({ search: () => searchResult([]) });
   render(<App />);
-  // Location is the one field nothing else can stand in for.
-  fillRequired({ location: '   ' });
-  expect(screen.getByRole('button', { name: /search candidates/i }).disabled).toBe(true);
-  expect(screen.getByText(/a location is required, along with a role or at least one skill/i)).toBeTruthy();
-  expect(calls.length).toBe(0);
+  opened();
 
-  // And whitespace in both role and skills leaves neither satisfied.
-  fillRequired({ location: 'delhi', jobTitle: '  ', keywords: '   ' });
-  expect(screen.getByRole('button', { name: /search candidates/i }).disabled).toBe(true);
-  expect(calls.length).toBe(0);
+  // Committing whitespace searches, because everything searches now - but it
+  // reaches Apollo as no filter rather than as a term that matches nothing.
+  fillRequired({ jobTitle: '  ', keywords: '   ' });
+  applySearch();
+  await waitFor(() => expect(searchCalls().length).toBe(1));
+  expect(searchCalls()[0].body.jobTitle.trim()).toBe('');
+  expect(searchCalls()[0].body.keywords.trim()).toBe('');
+  // And nothing was committed as a chip either.
+  expect(document.querySelectorAll('.skill-chips .chip-static')).toHaveLength(0);
 });
 
-test('the required fields are marked required for assistive tech', async () => {
+test('no single field is marked required, because none of them is', async () => {
   mockBackend({});
   render(<App />);
-  // Location is the only genuinely required field now.
-  expect(screen.getByLabelText(/^location/i).required).toBe(true);
-  // Role and skills are each optional on their own - one of the two is needed,
-  // which no single field can express, so the form validates it instead.
+  // A role or a skill is needed, which no single field can express, so the
+  // form validates it rather than marking a field the recruiter could satisfy
+  // the other way.
   for (const pattern of [/role \/ job title/i, /^skills$/i]) {
     expect(screen.getByLabelText(pattern).required, String(pattern)).toBe(false);
   }
 });
 
-test('submitting an incomplete form names what is missing and calls nothing', async () => {
-  mockBackend({});
+test('submitting an empty form searches the pool rather than refusing', async () => {
+  mockBackend({ search: () => searchResult([]) });
   render(<App />);
-  fireEvent.change(screen.getByLabelText(/role \/ job title/i), { target: { value: 'java developer' } });
+  opened();
+
   fireEvent.submit(screen.getByLabelText(/role \/ job title/i).closest('form'));
-  // The inline hint also lists what is missing, so target the submit notice.
-  const notice = await screen.findByRole('status');
-  expect(notice.textContent).toMatch(/a location is required, along with a role or at least one skill/i);
-  expect(calls.length).toBe(0);
+  await waitFor(() => expect(searchCalls().length).toBe(1));
+  expect(searchCalls()[0].body.jobTitle).toBe('');
+  // No scolding: there is nothing the recruiter has failed to provide.
+  expect(screen.queryByText(/is required/i)).toBeNull();
 });
 // --- Explicit personal email reveal -----------------------------------------
 
@@ -573,7 +688,7 @@ function revealAndConfirm(button) {
 
 test('a search never reveals contact details on its own', async () => {
   await searchWith([bareCandidate('person-1', 'Test Candidate')]);
-  expect(calls.map((call) => call.url)).toEqual(['/api/candidates/search']);
+  expect([...new Set(calls.map((call) => call.url))]).toEqual(['/api/candidates/search']);
   expect(calls.some((call) => call.url === '/api/candidates/reveal')).toBe(false);
 });
 
@@ -614,7 +729,7 @@ test('a running reveal shows a loading state and blocks a second request', async
 
   release();
   await waitFor(() => expect(within(rowFor('Test Candidate')).queryByText('Revealing contact details...')).toBeNull());
-  expect(within(rowFor('Test Candidate')).getByText('Yes')).toBeTruthy();
+  expect(within(rowFor('Test Candidate')).getByText('Enriched')).toBeTruthy();
 });
 
 test('a partial reveal shows the address it got and Not available for the rest', async () => {
@@ -626,7 +741,7 @@ test('a partial reveal shows the address it got and Not available for the rest',
       enrichedCandidate('person-2', 'Other Candidate', { email: null, emailAvailable: false })
     ])
   );
-  fireEvent.click(screen.getByRole('button', { name: /select all/i }));
+  selectEveryRow();
   revealAndConfirm();
 
   const found = await detailsPanel('Test Candidate');
@@ -658,7 +773,7 @@ test('a failed reveal keeps the candidate enriched instead of erasing the row', 
   await screen.findByText(/rate limit/i);
 
   // The reveal failed, so the row keeps the enrichment it already had.
-  expect(within(rowFor('Test Candidate')).getByText('Yes')).toBeTruthy();
+  expect(within(rowFor('Test Candidate')).getByText('Enriched')).toBeTruthy();
   await detailsPanel('Test Candidate');
 });
 
@@ -766,7 +881,7 @@ test('shows the work address and the personal one when Apollo returns both', asy
   expect(personal.getAttribute('href')).toBe('mailto:first.last.personal@gmail.com');
 });
 
-test('no personal row appears when Apollo returned only a work address', async () => {
+test('a reveal that found no personal address says so, rather than nothing', async () => {
   await searchWith(
     [bareCandidate('person-1', 'Test Candidate')],
     undefined,
@@ -779,7 +894,11 @@ test('no personal row appears when Apollo returned only a work address', async (
 
   const panel = await detailsPanel('Test Candidate');
   expect(within(panel).getByText('Work email')).toBeTruthy();
-  expect(within(panel).queryByText('Personal email')).toBeNull();
+  // The credit was spent and the answer was "there isn't one". Hiding the row
+  // left the recruiter looking at the work address they already had, unable to
+  // tell an empty answer from a reveal that never ran.
+  expect(within(panel).getByText('Personal email')).toBeTruthy();
+  expect(within(panel).getByText(/apollo holds no personal email/i)).toBeTruthy();
 });
 
 
@@ -787,7 +906,7 @@ test('no personal row appears when Apollo returned only a work address', async (
 test('a selection over the cap says how many will actually be charged', async () => {
   const people = Array.from({ length: 14 }, (_, index) => bareCandidate(`person-${index}`, `Candidate ${index}`));
   await searchWith(people, undefined, () => revealResponse([]));
-  fireEvent.click(screen.getByRole('button', { name: /select all/i }));
+  selectEveryRow();
   // 14 selected, but a reveal is capped at 10 to protect the account, and the
   // button says so before it is pressed.
   expect(revealButton().textContent).toMatch(/reveal email - 10 credits/i);
@@ -836,7 +955,7 @@ test('a search retries once when the dev server was restarting', async () => {
   });
   render(<App />);
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
 
   await screen.findByText('Test Candidate');
   expect(attempts).toBe(2);
@@ -848,13 +967,16 @@ test('a search that is still unreachable reports it rather than looping', async 
   let attempts = 0;
   mockBackend({ search: () => { attempts += 1; return proxyUnreachable(); } });
   render(<App />);
+  // The opening search gives up first; this counts the one the test asks for.
+  await screen.findByText(/candidate api is not running/i, {}, { timeout: 8000 });
+  const afterOpening = attempts;
+
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
 
   // Three retries on a backoff, then it gives up and says so.
-  await screen.findByText(/candidate api is not running/i, {}, { timeout: 8000 });
-  expect(attempts).toBe(4, 'a bounded number of retries, not an endless loop');
-});
+  await waitFor(() => expect(attempts).toBe(afterOpening + 4), { timeout: 8000 });
+}, 20000);
 
 test('a reveal never retries a dropped connection', async () => {
   let attempts = 0;
@@ -921,10 +1043,12 @@ test('an enriched candidate can still be revealed for a personal address', async
 test('every search asks Apollo only for candidates it holds an address for', async () => {
   mockBackend({ search: () => searchResult([bareCandidate('person-1', 'Test Candidate')]) });
   render(<App />);
-  fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
   await screen.findByText('Test Candidate');
-  expect(calls[0].body.verifiedEmailOnly).toBe(true);
+  fillRequired();
+  applySearch();
+  await waitFor(() => expect(searchCalls().length).toBe(1));
+  // Every search, the opening one included.
+  expect(calls.every((call) => call.body.verifiedEmailOnly === true)).toBe(true);
 
   // No longer a question put to the recruiter: an unreachable candidate cannot
   // be contacted or revealed, so the wider pool was only dead ends.
@@ -936,9 +1060,9 @@ test('every search asks Apollo only for candidates it holds an address for', asy
   expect(screen.queryByText(/one in five candidates has no address/i)).toBeNull();
 
   // And it stays on for every subsequent search, including a paged one.
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
-  await waitFor(() => expect(calls.length).toBe(2));
-  expect(calls[1].body.verifiedEmailOnly).toBe(true);
+  applySearch();
+  await waitFor(() => expect(searchCalls().length).toBe(2));
+  expect(searchCalls()[1].body.verifiedEmailOnly).toBe(true);
 });
 
 
@@ -967,7 +1091,7 @@ test('a mixed selection charges only for the candidates worth asking about', asy
     undefined,
     () => revealResponse([enrichedCandidate('person-1', 'Has Address', { email: 'has@example-co.com', emailType: 'work' })])
   );
-  fireEvent.click(screen.getByRole('button', { name: /select all/i }));
+  selectEveryRow();
   fireEvent.click(revealButton());
 
   // Two selected, one charged.
@@ -1036,32 +1160,22 @@ function keywordBox() {
   return screen.getByLabelText(/^skills$/i);
 }
 
-test('the results search box narrows the loaded rows by candidate name', async () => {
+test('typing in the box hides nothing: the rows are what Apollo returned', async () => {
+  // It used to filter the 25 rows in hand, which answered a question nobody
+  // asked - "which of this page matches?" - while the pool it was drawn from
+  // went unsearched. Typing now stages a search; the rows stay as they are
+  // until Apollo answers a new one.
   await loadedPool([
     { ...bareCandidate('person-1', 'Zahid'), company: 'eBhasha Setu' },
     { ...bareCandidate('person-2', 'Aman'), company: 'Canopy' },
-    { ...bareCandidate('person-3', 'Sachin'), company: 'Palni Inc', title: 'Senior Python Developer' }
+    { ...bareCandidate('person-3', 'Sachin'), company: 'Palni Inc' }
   ]);
   expect(visibleNames()).toEqual(['Zahid', 'Aman', 'Sachin']);
 
-  // By name.
   fireEvent.change(rowSearch(), { target: { value: 'aman' } });
-  expect(visibleNames()).toEqual(['Aman']);
+  expect(visibleNames()).toEqual(['Zahid', 'Aman', 'Sachin']);
 
-  // A company is not a name: the box finds candidates, not employers.
-  fireEvent.change(rowSearch(), { target: { value: 'palni' } });
-  expect(visibleNames()).toEqual([]);
-
-  // Nor is a job title.
-  fireEvent.change(rowSearch(), { target: { value: 'senior' } });
-  expect(visibleNames()).toEqual([]);
-
-  // A partial name still matches.
-  fireEvent.change(rowSearch(), { target: { value: 'sach' } });
-  expect(visibleNames()).toEqual(['Sachin']);
-
-  // Cleared, everyone is back.
-  fireEvent.change(rowSearch(), { target: { value: '' } });
+  fireEvent.change(rowSearch(), { target: { value: 'nobody here' } });
   expect(visibleNames()).toEqual(['Zahid', 'Aman', 'Sachin']);
 });
 
@@ -1077,39 +1191,16 @@ test('the results search never calls Apollo', async () => {
   expect(calls.length).toBe(before);
 });
 
-test('the box says it only sees the loaded page, not the whole pool', async () => {
+test('the box says what pressing Enter will actually search', async () => {
   await loadedPool([bareCandidate('person-1', 'Zahid'), bareCandidate('person-2', 'Aman')], 234);
 
   fireEvent.change(rowSearch(), { target: { value: 'aman' } });
-  expect(screen.getByText(/1 of 2 names on this page match/i)).toBeTruthy();
-  // The honest limit, and the way out of it.
-  expect(screen.getByText(/press enter to search all of apollo for that name, narrowed by your role and skills/i)).toBeTruthy();
+  // The whole pool the filters describe, not the page in hand - and it names
+  // the filters that pool is made of.
+  expect(screen.getByText(/press enter to search every role and skills in the pool for "aman"/i)).toBeTruthy();
 });
 
-test('a query matching nothing on this page says so without claiming the pool is empty', async () => {
-  await loadedPool([bareCandidate('person-1', 'Zahid')], 234);
 
-  fireEvent.change(rowSearch(), { target: { value: 'nobody here' } });
-  expect(screen.getByText(/no name on this page matches "nobody here"/i)).toBeTruthy();
-  expect(visibleNames()).toEqual([]);
-  // Not reported as an empty market.
-  expect(screen.queryByText(/no matching candidates found/i)).toBeNull();
-});
-
-test('a row hidden by the search box is never selected by Select all', async () => {
-  await loadedPool([
-    { ...bareCandidate('person-1', 'Zahid'), hasEmailOnFile: true },
-    { ...bareCandidate('person-2', 'Aman'), hasEmailOnFile: true }
-  ]);
-
-  fireEvent.change(rowSearch(), { target: { value: 'aman' } });
-  fireEvent.click(screen.getByRole('button', { name: /select all/i }));
-
-  // Credit safety: Select all must not reach past what is on screen, and the
-  // price on the button is the proof of it.
-  expect(selectionCount()).toMatch(/Selected: *1/);
-  expect(screen.getByRole('button', { name: /^reveal email/i }).textContent).toMatch(/1 credit$/i);
-});
 
 
 
@@ -1131,7 +1222,7 @@ function namePool({ base, byName }) {
   });
   render(<App />);
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
 }
 
 const rows = (names) => names.map((name, index) => bareCandidate(`person-${index + 1}`, name));
@@ -1142,8 +1233,10 @@ test('a name is sent to Apollo so the search covers every page, not just this on
   await screen.findByText('Candidate 1');
 
   fireEvent.change(rowSearch(), { target: { value: 'Adhitya' } });
-  // Nothing on this page, but the pool has 26 profiles, so there is more to look at.
-  expect(screen.getByText(/no name on this page matches "adhitya"/i)).toBeTruthy();
+  // Nobody of that name is on this page, and the box does not pretend to know
+  // whether anybody in the pool is: it offers to ask.
+  expect(screen.getByText(/press enter to search .* for "adhitya"/i)).toBeTruthy();
+  expect(visibleNames()).toContain('Candidate 1');
 
   searchByName();
 
@@ -1169,6 +1262,9 @@ test('an active name filter is stated plainly and can be cleared', async () => {
   namePool({ base: rows(['Someone Else', 'Another One']), byName: { Aman: rows(['Aman', 'Aman Two']) } });
   await screen.findByText('Someone Else');
 
+  // A location is applied first, so the copy has one to leave out.
+  tickLocation('Hyderabad');
+  await screen.findByText('Someone Else');
   fireEvent.change(rowSearch(), { target: { value: 'Aman' } });
   searchByName();
   await screen.findByText('Aman');
@@ -1181,7 +1277,9 @@ test('an active name filter is stated plainly and can be cleared', async () => {
   expect(screen.getByText(/2 profiles\./i)).toBeTruthy();
   expect(screen.getByText(/location is not applied to a name search/i)).toBeTruthy();
 
-  fireEvent.click(screen.getByRole('button', { name: /^clear name$/i }));
+  // The cross inside the box is the way out of a name filter now: there is no
+  // separate link beside it.
+  fireEvent.click(screen.getByRole('button', { name: /clear the name filter/i }));
   await screen.findByText('Someone Else');
   expect(calls.at(-1).body.personName).toBe('');
   expect(screen.queryByText(/apollo is filtering the whole pool/i)).toBeNull();
@@ -1241,7 +1339,7 @@ test('searching the pool again drops the name instead of ANDing it on', async ()
   await screen.findByText('Aman');
 
   // Describing a pool is the opposite question to naming a person.
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   await screen.findByText('Someone Else');
   const sent = calls.at(-1).body;
   expect(sent.personName).toBe('');
@@ -1283,13 +1381,16 @@ test('every profile a name search returns is actually rendered', async () => {
   expect(screen.getByText(/4 profiles\./i)).toBeTruthy();
 });
 
-test('typing something new still narrows the rows a name search returned', async () => {
+test('typing a new name stages a second search rather than hiding the first', async () => {
   namePool({
     base: rows(['Someone Else']),
-    byName: { 'Aditya Sai': [
-      { ...bareCandidate('person-1', 'Sai'), company: 'Clarivate' },
-      { ...bareCandidate('person-2', 'Aditya'), company: 'LexisNexis' }
-    ] }
+    byName: {
+      'Aditya Sai': [
+        { ...bareCandidate('person-1', 'Sai'), company: 'Clarivate' },
+        { ...bareCandidate('person-2', 'Aditya'), company: 'LexisNexis' }
+      ],
+      aditya: [{ ...bareCandidate('person-2', 'Aditya'), company: 'LexisNexis' }]
+    }
   });
   await screen.findByText('Someone Else');
 
@@ -1298,11 +1399,15 @@ test('typing something new still narrows the rows a name search returned', async
   await screen.findByText('Sai');
   expect(visibleNames()).toEqual(['Sai', 'Aditya']);
 
-  // Once the box says something other than the searched name, it is a local
-  // filter again and narrows what Apollo returned - by name.
+  // A different name in the box changes nothing until it is searched: what is
+  // on screen is still the answer to the last question asked.
   fireEvent.change(rowSearch(), { target: { value: 'aditya' } });
-  expect(visibleNames()).toEqual(['Aditya']);
+  expect(visibleNames()).toEqual(['Sai', 'Aditya']);
   expect(calls.at(-1).body.personName).toBe('Aditya Sai');
+
+  searchByName();
+  await waitFor(() => expect(calls.at(-1).body.personName).toBe('aditya'));
+  await waitFor(() => expect(visibleNames()).toEqual(['Aditya']));
 });
 
 test('Select all reaches every row a name search returned', async () => {
@@ -1319,7 +1424,7 @@ test('Select all reaches every row a name search returned', async () => {
   searchByName();
   await screen.findByText('Sai');
 
-  fireEvent.click(screen.getByRole('button', { name: /select all/i }));
+  selectEveryRow();
   // Both, because neither is hidden any more.
   expect(selectionCount()).toMatch(/Selected: *2/);
 });
@@ -1350,7 +1455,7 @@ async function phoneFlow(people, { phone, poll }) {
   mockBackend({ search: () => searchResult(people), phone, poll });
   render(<App />);
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   for (const person of people) await screen.findByText(person.name);
   for (const person of people) {
     fireEvent.click(screen.getByRole('checkbox', { name: new RegExp(`select ${person.name}`, 'i') }));
@@ -1462,7 +1567,10 @@ test('an unreachable webhook is reported without leaving the row broken', async 
   await screen.findByText(/apollo_webhook_url is not set/i);
   // The candidate is left as it was, not marked failed for something that never
   // reached Apollo.
-  expect(within(rowFor('Test Candidate')).getByText('Not enriched')).toBeTruthy();
+  // Nothing claims a state the row has not reached: no badge, and no details
+  // to open.
+  expect(within(rowFor('Test Candidate')).queryByText(/enriched/i)).toBeNull();
+  expect(within(rowFor('Test Candidate')).queryByRole('button', { name: /view details/i })).toBeNull();
 });
 
 test('Apollo saying it has no number means no mobile credit is spent', async () => {
@@ -1474,7 +1582,7 @@ test('Apollo saying it has no number means no mobile credit is spent', async () 
   });
   render(<App />);
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   await screen.findByText('No Number');
 
   fireEvent.click(screen.getByRole('checkbox', { name: /select no number/i }));
@@ -1495,7 +1603,7 @@ test('the Find personal emails button is gone from the toolbar', async () => {
   mockBackend({ search: () => searchResult([{ ...bareCandidate('person-1', 'Test Candidate'), hasEmailOnFile: true }]) });
   render(<App />);
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   await screen.findByText('Test Candidate');
 
   expect(screen.queryByRole('button', { name: /find personal emails/i })).toBeNull();
@@ -1517,7 +1625,7 @@ test('nothing in the UI can start a waterfall search any more', async () => {
   });
   render(<App />);
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   await screen.findByText('Test Candidate');
 
   fireEvent.click(screen.getByRole('checkbox', { name: /select test candidate/i }));
@@ -1537,12 +1645,14 @@ test('a name search never applies location, because it zeroes the result out', a
   // almost nothing it holds.
   namePool({ base: rows(['Someone Else']), byName: { Aditya: rows(['Aditya', 'Aditya Two']) } });
   await screen.findByText('Someone Else');
-  expect(screen.getByLabelText(/^location/i).value).toBe('delhi');
+  // A location ticked from the results is applied to the pool search.
+  tickLocation('Hyderabad');
+  await waitFor(() => expect(calls.at(-1).body.location).toBe('Hyderabad'));
 
   fireEvent.change(rowSearch(), { target: { value: 'Aditya' } });
   // No question put to the recruiter: there is a right answer here.
   expect(screen.queryByRole('checkbox', { name: /also narrow the name search/i })).toBeNull();
-  expect(rowSearch().placeholder).toMatch(/press enter to search all of apollo/i);
+  expect(rowSearch().placeholder).toMatch(/search by candidate name/i);
 
   searchByName();
   await screen.findByText('Aditya');
@@ -1561,16 +1671,41 @@ test('a pool search still applies location', async () => {
   // Only the name path drops it; describing a pool is a different question.
   namePool({ base: rows(['Someone Else']), byName: {} });
   await screen.findByText('Someone Else');
-  expect(calls.at(-1).body.location).toBe('delhi');
+  tickLocation('Hyderabad');
+  await waitFor(() => expect(calls.at(-1).body.location).toBe('Hyderabad'));
+});
+
+test('the search button runs the same name search as Enter', async () => {
+  namePool({ base: rows(['Someone Else']), byName: { Aditya: rows(['Aditya']) } });
+  await screen.findByText('Someone Else');
+  const go = () => screen.getByRole('button', { name: /search apollo for this name/i });
+
+  // An idle, empty box is a box: neither control is on it until it is in use.
+  expect(screen.queryByRole('button', { name: /search apollo for this name/i })).toBeNull();
+  fireEvent.focus(rowSearch());
+  // Focused but empty: there is nothing to search for, and it says so.
+  expect(go().disabled).toBe(true);
+
+  fireEvent.change(rowSearch(), { target: { value: 'Aditya' } });
+  expect(go().disabled).toBe(false);
+  fireEvent.click(go());
+  await screen.findByText('Aditya');
+  expect(calls.at(-1).body.personName).toBe('Aditya');
+
+  // The same name is the search already on screen, so it cannot be spent twice.
+  expect(go().disabled).toBe(true);
 });
 
 test('the name box is the only control, and it searches on Enter alone', async () => {
   namePool({ base: rows(['Someone Else']), byName: { Aditya: rows(['Aditya']) } });
   await screen.findByText('Someone Else');
 
-  // No button beside it any more: the box is the whole control.
-  expect(screen.queryByRole('button', { name: /by name/i })).toBeNull();
-  expect(rowSearch().placeholder).toMatch(/candidate name - press enter to search all of apollo/i);
+  // One control: the box, with its own buttons inside it once it holds a name.
+  expect(rowSearch().placeholder).toMatch(/search by candidate name/i);
+  fireEvent.change(rowSearch(), { target: { value: 'Adi' } });
+  expect(screen.getByRole('button', { name: /search apollo for this name/i })).toBeTruthy();
+  expect(screen.getByRole('button', { name: /clear the box/i })).toBeTruthy();
+  fireEvent.change(rowSearch(), { target: { value: '' } });
 
   fireEvent.change(rowSearch(), { target: { value: 'Aditya' } });
   // Typing alone must not spend a search.
@@ -1598,10 +1733,10 @@ test('the single search form is the only way in', async () => {
   // The pool form is there, unwrapped, with its own fields intact.
   expect(screen.getByLabelText(/role \/ job title/i)).toBeTruthy();
   expect(screen.getByLabelText(/^skills$/i)).toBeTruthy();
-  expect(screen.getByRole('button', { name: /reset filters/i })).toBeTruthy();
+  expect(screen.getByRole('button', { name: /reset all/i })).toBeTruthy();
 
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   await screen.findByText('Test Candidate');
   // And nothing in the UI can reach the paid match endpoint any more.
   expect(calls.some((call) => call.url === '/api/candidates/lookup')).toBe(false);
@@ -1628,7 +1763,7 @@ async function loadedPool(people, total) {
   mockBackend({ search: () => poolOf(people, total) });
   render(<App />);
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   for (const person of people) await screen.findByText(person.name);
 }
 
@@ -1640,8 +1775,7 @@ test('role and skills are sent as typed, neither rewriting the other', async () 
   fireEvent.change(screen.getByLabelText(/role \/ job title/i),
     { target: { value: 'AI/ML Engineer, Machine Learning Engineer, Data Scientist' } });
   fireEvent.change(screen.getByLabelText(/^skills$/i), { target: { value: 'Python, LLM, Machine Learning' } });
-  fireEvent.change(screen.getByLabelText(/^location/i), { target: { value: 'Hyderabad' } });
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   await screen.findByText('Test Candidate');
 
   const sent = calls.at(-1).body;
@@ -1653,18 +1787,17 @@ test('role and skills are sent as typed, neither rewriting the other', async () 
 test('a role-only search and a skills-only search both reach Apollo', async () => {
   mockBackend({ search: () => searchResult([bareCandidate('person-1', 'Test Candidate')]) });
   render(<App />);
-  fireEvent.change(screen.getByLabelText(/^location/i), { target: { value: 'Hyderabad' } });
 
   // Role only - skills left empty, which used to block the search entirely.
   fireEvent.change(screen.getByLabelText(/role \/ job title/i), { target: { value: 'AI/ML Engineer' } });
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   await screen.findByText('Test Candidate');
   expect(calls.at(-1).body.keywords).toBe('');
 
   // Skills only, no role.
   fireEvent.change(screen.getByLabelText(/role \/ job title/i), { target: { value: '' } });
   fireEvent.change(screen.getByLabelText(/^skills$/i), { target: { value: 'Python' } });
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   await waitFor(() => expect(calls.at(-1).body.keywords).toBe('Python'));
   expect(calls.at(-1).body.jobTitle).toBe('');
 });
@@ -1686,8 +1819,7 @@ test('the skills a candidate matched are shown on the row', async () => {
   });
   render(<App />);
   fireEvent.change(screen.getByLabelText(/^skills$/i), { target: { value: 'Python, LLM, Machine Learning' } });
-  fireEvent.change(screen.getByLabelText(/^location/i), { target: { value: 'Hyderabad' } });
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   await screen.findByText('Strong Match');
 
   const chips = (name) => [...rowFor(name).querySelectorAll('.matched-skills li')].map((li) => li.textContent);
@@ -1696,7 +1828,7 @@ test('the skills a candidate matched are shown on the row', async () => {
 
   // No single total exists for a union, so the per-skill pools are shown and
   // the count describes what it actually is.
-  expect(screen.getByText(/2 candidates matching any of 3 skills/i)).toBeTruthy();
+  expect(screen.getByText(/2 matching any of 3 skills/i)).toBeTruthy();
   expect(screen.getByText(/a candidate needs only one of them/i)).toBeTruthy();
   expect(screen.getByText(/297/)).toBeTruthy();
 });
@@ -1718,36 +1850,37 @@ test('every skill can be required at once, in one Apollo request', async () => {
   });
   render(<App />);
   fireEvent.change(screen.getByLabelText(/^skills$/i), { target: { value: 'python, c++' } });
-  fireEvent.change(screen.getByLabelText(/^location/i), { target: { value: 'hyderabad' } });
+  // Entering the second skill commits both and searches on them.
+  fireEvent.keyDown(screen.getByLabelText(/^skills$/i), { key: 'Enter' });
 
   // Any-of is the default, because it finds people.
-  const everySkill = screen.getByRole('checkbox', { name: /must have every skill/i });
-  expect(everySkill.checked).toBe(false);
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
   await screen.findByText(/2 skills/i);
   expect(calls.at(-1).body.matchAllSkills).toBe(false);
   expect(screen.getByText(/needs only one of them/i)).toBeTruthy();
 
-  // Ticking it asks the strict question instead.
+  // The choice only exists once there are two skills to choose between, and
+  // ticking it asks the strict question straight away.
+  const everySkill = screen.getByRole('checkbox', { name: /must have every skill/i });
+  expect(everySkill.checked).toBe(false);
   fireEvent.click(everySkill);
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
   await waitFor(() => expect(calls.at(-1).body.matchAllSkills).toBe(true));
 
   await screen.findByText(/every skill was required at once/i);
   expect(screen.getByText('python + c++')).toBeTruthy();
   // A single request means Apollo's own total is real again.
-  expect(screen.getByText(/showing 1 of 3 profiles/i)).toBeTruthy();
+  expect(screen.getByText('3 profiles')).toBeTruthy();
 });
 
 test('the every-skill choice only appears when there is more than one skill', async () => {
   mockBackend({ search: () => searchResult([]) });
   render(<App />);
-  fireEvent.change(screen.getByLabelText(/^location/i), { target: { value: 'hyderabad' } });
 
   fireEvent.change(screen.getByLabelText(/^skills$/i), { target: { value: 'python' } });
+  fireEvent.keyDown(screen.getByLabelText(/^skills$/i), { key: 'Enter' });
   expect(screen.queryByRole('checkbox', { name: /must have every skill/i })).toBeNull();
 
-  fireEvent.change(screen.getByLabelText(/^skills$/i), { target: { value: 'python, c++' } });
+  fireEvent.change(screen.getByLabelText(/^skills$/i), { target: { value: 'c++' } });
+  fireEvent.keyDown(screen.getByLabelText(/^skills$/i), { key: 'Enter' });
   expect(screen.getByRole('checkbox', { name: /must have every skill/i })).toBeTruthy();
 });
 
@@ -1758,9 +1891,9 @@ test('the seniority list offers only values Apollo actually recognises', async (
   // silently emptied the results with nothing on screen to explain it.
   mockBackend({ search: () => searchResult([]) });
   render(<App />);
-  const values = [...screen.getByLabelText(/seniority/i).querySelectorAll('option')].map((option) => option.value);
+  const values = [...document.querySelectorAll('.filter-form input[name="seniority"]')].map((box) => box.value);
 
-  expect(values).toEqual(['', 'intern', 'entry', 'senior', 'manager']);
+  expect(values).toEqual(['intern', 'entry', 'senior', 'manager']);
   // Not Apollo values at all: either one silently emptied every search.
   expect(values).not.toContain('junior');
   expect(values).not.toContain('mid_level');
@@ -1771,14 +1904,23 @@ test('the seniority list offers only values Apollo actually recognises', async (
   }
 });
 
-test('a chosen seniority is sent to Apollo as given', async () => {
+test('seniority levels are sent to Apollo as given, and several are one search', async () => {
   mockBackend({ search: () => searchResult([bareCandidate('person-1', 'Test Candidate')]) });
   render(<App />);
   fillRequired();
-  fireEvent.change(screen.getByLabelText(/seniority/i), { target: { value: 'entry' } });
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   await screen.findByText('Test Candidate');
-  expect(calls.at(-1).body.seniority).toBe('entry');
+
+  fireEvent.click(screen.getByRole('checkbox', { name: /^entry$/i }));
+  await waitFor(() => expect(calls.at(-1).body.seniority).toBe('entry'));
+
+  // A hire open to two levels is one query, not two.
+  fireEvent.click(screen.getByRole('checkbox', { name: /^senior$/i }));
+  await waitFor(() => expect(calls.at(-1).body.seniority).toBe('entry, senior'));
+
+  // And unticking one leaves the other alone.
+  fireEvent.click(screen.getByRole('checkbox', { name: /^entry$/i }));
+  await waitFor(() => expect(calls.at(-1).body.seniority).toBe('senior'));
 });
 
 
@@ -1831,13 +1973,12 @@ test('picking a role replaces the field, and the list closes when clicked away',
   // Clicking anywhere else closes the list, whether or not the field had focus.
   fireEvent.focus(role);
   expect(screen.getByRole('listbox')).toBeTruthy();
-  fireEvent.mouseDown(screen.getByLabelText(/^location/i));
+  fireEvent.mouseDown(screen.getByLabelText(/^skills$/i));
   expect(screen.queryByRole('listbox')).toBeNull();
 
   // Several titles still combine when typed, because Apollo ORs them.
   fireEvent.change(role, { target: { value: 'Data Scientist, AI/ML Engineer' } });
-  fireEvent.change(screen.getByLabelText(/^location/i), { target: { value: 'hyderabad' } });
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   await screen.findByText('Test Candidate');
   expect(calls.at(-1).body.jobTitle).toBe('Data Scientist, AI/ML Engineer');
 });
@@ -1874,13 +2015,17 @@ test('skills accumulate, and anything can still be typed', async () => {
   const skills = screen.getByLabelText(/^skills$/i);
   fireEvent.change(screen.getByLabelText(/role \/ job title/i), { target: { value: 'Data Scientist' } });
 
-  // Unlike the role, skills build a list: each one is its own Apollo search.
+  // Unlike the role, skills build a list: each one becomes its own chip and the
+  // box is left empty for the next.
+  const skillChips = () => [...document.querySelectorAll('.skill-chips .chip-static')]
+    .map((chip) => chip.textContent);
   fireEvent.focus(skills);
   fireEvent.mouseDown(screen.getByRole('option', { name: 'python' }));
-  expect(skills.value).toBe('python, ');
+  expect(skillChips()).toEqual(['python']);
+  expect(skills.value).toBe('');
   fireEvent.focus(skills);
   fireEvent.mouseDown(screen.getByRole('option', { name: 'machine learning' }));
-  expect(skills.value).toBe('python, machine learning, ');
+  expect(skillChips()).toEqual(['python', 'machine learning']);
 
   // One already chosen is not offered again.
   fireEvent.focus(skills);
@@ -1888,9 +2033,10 @@ test('skills accumulate, and anything can still be typed', async () => {
     .map((option) => option.textContent)).not.toContain('python');
 
   // And a skill nobody suggested still searches.
+  fireEvent.click(screen.getByRole('button', { name: /remove python/i }));
+  fireEvent.click(screen.getByRole('button', { name: /remove machine learning/i }));
   fireEvent.change(skills, { target: { value: 'rust, webassembly' } });
-  fireEvent.change(screen.getByLabelText(/^location/i), { target: { value: 'hyderabad' } });
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   await screen.findByText('Test Candidate');
   expect(calls.at(-1).body.keywords).toBe('rust, webassembly');
 });
@@ -1900,7 +2046,7 @@ test('no filter field offers the browser its own autofill history', async () => 
   // which cannot be filtered, styled, or kept relevant to the role.
   mockBackend({ search: () => searchResult([]) });
   render(<App />);
-  for (const label of [/role \/ job title/i, /^location/i, /^skills$/i]) {
+  for (const label of [/role \/ job title/i, /^skills$/i]) {
     expect(screen.getByLabelText(label).getAttribute('autocomplete'), String(label)).toBe('off');
   }
 });
@@ -1919,7 +2065,7 @@ test('the personal email filter is gone; the address shows on the row instead', 
   });
   render(<App />);
   fillRequired();
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  applySearch();
   await screen.findByText('Has Personal');
 
   expect(screen.queryByRole('checkbox', { name: /personal email only/i })).toBeNull();
@@ -1933,76 +2079,108 @@ test('the personal email filter is gone; the address shows on the row instead', 
   expect(within(contact).getByRole('link', { name: 'found@example-mail.test' })).toBeTruthy();
 });
 
-// --- Multiple locations -----------------------------------------------------
+// --- Location: ticked from what the search returned -------------------------
 
-function locationBox() {
-  return screen.getByLabelText(/^location/i);
+function locationOptions() {
+  return [...document.querySelectorAll('.location-options .option-name')].map((name) => name.textContent);
 }
 
-function locationChips() {
-  return [...document.querySelectorAll('.location-chips .chip-static')].map((chip) => chip.textContent);
-}
-
-test('one location behaves exactly as it did before', async () => {
-  mockBackend({ search: () => searchResult([bareCandidate('person-1', 'Test Candidate')]) });
+// A pool whose rows sit in several cities, so the list has something to offer.
+function poolIn(cities) {
+  mockBackend({
+    search: () => searchResult(cities.map((city, index) => ({
+      ...bareCandidate(`person-${index + 1}`, `Candidate ${index + 1}`), location: city
+    })))
+  });
   render(<App />);
   fireEvent.change(screen.getByLabelText(/role \/ job title/i), { target: { value: 'Frontend Developer' } });
-  fireEvent.change(locationBox(), { target: { value: 'Hyderabad' } });
+  applySearch();
+}
 
-  // Chips from the first value, so the search always reads as a list.
-  expect(locationChips()).toEqual(['Hyderabad']);
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
-  await screen.findByText('Test Candidate');
+test('a city named by the results leads the list, with its count beside it', async () => {
+  // Apollo has no facet endpoint and usually returns no location on a search
+  // row at all, so the standing list is what makes this filter usable - but
+  // when rows do name a city, that city is promoted above the standing list.
+  poolIn(['Hyderabad, Telangana, India', 'Bangalore, Karnataka, India', 'Hyderabad, Telangana, India']);
+  await screen.findByText('Candidate 1');
+
+  // The city, not the whole "city, state, country" string Apollo writes, and
+  // the commonest first with its count beside it.
+  expect(locationOptions().slice(0, 2)).toEqual(['Hyderabad', 'Bangalore']);
+  expect(screen.getByText('2')).toBeTruthy();
+  // Each city once, however many lists it belongs to.
+  expect(locationOptions().filter((city) => city === 'Hyderabad')).toHaveLength(1);
+  // And the standing list is still there underneath.
+  expect(locationOptions()).toContain('Chennai');
+});
+
+test('ticking a city narrows the same search rather than starting a new one', async () => {
+  poolIn(['Hyderabad', 'Bangalore']);
+  await screen.findByText('Candidate 1');
+  const first = calls.length;
+
+  tickLocation('Hyderabad');
+  await waitFor(() => expect(calls.length).toBe(first + 1));
   expect(calls.at(-1).body.location).toBe('Hyderabad');
+  expect(calls.at(-1).body.jobTitle).toBe('Frontend Developer');
 });
 
-test('several locations are searched as an OR and each one is shown', async () => {
+test('several cities are searched as an OR, and unticking one leaves the rest', async () => {
+  poolIn(['Hyderabad', 'Bangalore', 'Pune']);
+  await screen.findByText('Candidate 1');
+
+  tickLocation('Hyderabad');
+  await waitFor(() => expect(calls.at(-1).body.location).toBe('Hyderabad'));
+  tickLocation('Bangalore');
+  // Sent whole; the backend splits it into the OR Apollo expects.
+  await waitFor(() => expect(calls.at(-1).body.location).toBe('Hyderabad, Bangalore'));
+  expect(screen.getByText(/candidates in any of these cities/i)).toBeTruthy();
+
+  tickLocation('Hyderabad');
+  await waitFor(() => expect(calls.at(-1).body.location).toBe('Bangalore'));
+});
+
+test('a ticked city stays on the list even when the results no longer hold it', async () => {
+  // Otherwise narrowing to one city would remove every other city from the
+  // list, including the one just ticked, leaving no way to untick it.
+  poolIn(['Hyderabad', 'Bangalore']);
+  await screen.findByText('Candidate 1');
+  tickLocation('Bangalore');
+
+  await waitFor(() => expect(calls.at(-1).body.location).toBe('Bangalore'));
+  expect(locationOptions()).toContain('Bangalore');
+  expect(screen.getByRole('checkbox', { name: /^bangalore/i }).checked).toBe(true);
+});
+
+test('the city list is usable before any search, and takes one it does not hold', async () => {
   mockBackend({ search: () => searchResult([bareCandidate('person-1', 'Test Candidate')]) });
   render(<App />);
-  fireEvent.change(screen.getByLabelText(/role \/ job title/i), { target: { value: 'Frontend Developer' } });
-  fireEvent.change(locationBox(), { target: { value: 'Hyderabad, Bangalore, Pune' } });
+  // Offered from the start, because Apollo cannot tell us which cities a pool
+  // holds and an empty list would leave the filter unusable.
+  expect(locationOptions()).toContain('Hyderabad');
+  // Ticking one narrows the pool that is already on screen.
+  tickLocation('Hyderabad');
+  await waitFor(() => expect(searchCalls().length).toBe(1));
+  expect(searchCalls()[0].body.location).toBe('Hyderabad');
 
-  expect(locationChips()).toEqual(['Hyderabad', 'Bangalore', 'Pune']);
-  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
-  await screen.findByText('Test Candidate');
-  // Sent whole; the backend splits it into the OR Apollo expects.
-  expect(calls.at(-1).body.location).toBe('Hyderabad, Bangalore, Pune');
-});
+  // The box searches the list first: typing narrows it to what matches, with
+  // the ticked city kept on screen so it can still be unticked.
+  const box = screen.getByLabelText(/search or add a city/i);
+  fireEvent.change(box, { target: { value: 'che' } });
+  expect(locationOptions()).toEqual(['Hyderabad', 'Chennai']);
 
-test('one location can be removed without retyping the others', async () => {
-  mockBackend({ search: () => searchResult([]) });
-  render(<App />);
-  fireEvent.change(locationBox(), { target: { value: 'Hyderabad, Bangalore, Pune' } });
+  // And a city the list does not hold is added by the same box.
+  fireEvent.change(box, { target: { value: 'Mysuru' } });
+  expect(screen.getByText(/press enter to add/i)).toBeTruthy();
+  fireEvent.keyDown(box, { key: 'Enter' });
+  expect(locationOptions()).toContain('Mysuru');
+  expect(screen.getByRole('checkbox', { name: /^mysuru/i }).checked).toBe(true);
+  await waitFor(() => expect(searchCalls().at(-1).body.location).toBe('Hyderabad, Mysuru'));
 
-  fireEvent.click(screen.getByRole('button', { name: /remove bangalore/i }));
-  expect(locationChips()).toEqual(['Hyderabad', 'Pune']);
-  expect(locationBox().value).toBe('Hyderabad, Pune');
-
-  fireEvent.click(screen.getByRole('button', { name: /remove pune/i }));
-  expect(locationChips()).toEqual(['Hyderabad']);
-  expect(locationBox().value).toBe('Hyderabad');
-});
-
-test('a location repeated is still one location', async () => {
-  mockBackend({ search: () => searchResult([]) });
-  render(<App />);
-  fireEvent.change(locationBox(), { target: { value: 'Hyderabad, Bangalore, Hyderabad,, Pune ' } });
-  expect(locationChips()).toEqual(['Hyderabad', 'Bangalore', 'Pune']);
-});
-
-test('an empty location is still required, however it is written', async () => {
-  mockBackend({ search: () => searchResult([]) });
-  render(<App />);
-  fireEvent.change(screen.getByLabelText(/role \/ job title/i), { target: { value: 'Frontend Developer' } });
-  const search = screen.getByRole('button', { name: /search candidates/i });
-
-  for (const value of ['', '   ', ' , , ']) {
-    fireEvent.change(locationBox(), { target: { value } });
-    expect(search.disabled, JSON.stringify(value)).toBe(true);
-  }
-  fireEvent.change(locationBox(), { target: { value: 'Hyderabad' } });
-  expect(search.disabled).toBe(false);
-  expect(calls.length).toBe(0);
+  // And it reaches Apollo once there is a role to search for.
+  fireEvent.change(screen.getByLabelText(/role \/ job title/i), { target: { value: 'Data Scientist' } });
+  applySearch();
+  await waitFor(() => expect(calls.at(-1).body.location).toBe('Hyderabad, Mysuru'));
 });
 
 test('skills get the same removable chips as locations', async () => {
@@ -2012,14 +2190,14 @@ test('skills get the same removable chips as locations', async () => {
   const skillChipList = () => [...document.querySelectorAll('.skill-chips .chip-static')]
     .map((chip) => chip.textContent);
 
-  fireEvent.change(skills, { target: { value: 'python, machine learning, python, sql' } });
+  fireEvent.change(skills, { target: { value: 'python, machine learning, python, sql,' } });
   // De-duplicated, and each one shown as its own value rather than as a string
   // of punctuation.
   expect(skillChipList()).toEqual(['python', 'machine learning', 'sql']);
 
   fireEvent.click(screen.getByRole('button', { name: /remove machine learning/i }));
   expect(skillChipList()).toEqual(['python', 'sql']);
-  expect(skills.value).toBe('python, sql');
+  expect(skills.value).toBe('');
 });
 
 test('a field label never picks up the chips as part of its name', async () => {
@@ -2028,9 +2206,7 @@ test('a field label never picks up the chips as part of its name', async () => {
   mockBackend({ search: () => searchResult([]) });
   render(<App />);
   fireEvent.change(screen.getByLabelText(/^skills$/i), { target: { value: 'python, sql' } });
-  fireEvent.change(screen.getByLabelText(/^location/i), { target: { value: 'Hyderabad, Pune' } });
 
-  // Still found by their own names, with the chips rendered outside them.
+  // Still found by its own name, with the chips rendered outside the label.
   expect(screen.getByLabelText(/^skills$/i).name).toBe('keywords');
-  expect(screen.getByLabelText(/^location/i).name).toBe('location');
 });

@@ -11,7 +11,7 @@ describe('enrichment lifecycle', () => {
   test('labels each state for the Enriched column', () => {
     expect(enrichmentLabel(NOT_ENRICHED)).toBe('Not enriched');
     expect(enrichmentLabel(ENRICHING)).toBe('Enriching...');
-    expect(enrichmentLabel(ENRICHED)).toBe('Yes');
+    expect(enrichmentLabel(ENRICHED)).toBe('Enriched');
     expect(enrichmentLabel(FAILED)).toBe('Enrichment failed');
   });
 

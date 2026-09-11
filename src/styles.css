@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap');
 
 :root {
   color: var(--body);
@@ -16,13 +16,27 @@
   --ink: #000000;           /* Headings */
   --body: #2e2e2e;          /* Paragraph text */
   --muted: #707070;         /* Mid grey */
+  --faint: #9AA0AC;         /* Placeholders, disabled copy */
 
   /* Surfaces */
-  --page: #F6F6F6;          /* Off white */
+  --page: #F4F6FA;          /* Off white, a shade cooler so white cards lift */
   --panel: #E1ECFF;         /* Light blue tint */
   --surface: #FFFFFF;
-  --line: #EBEBEB;
-  --line-strong: #B4BCCB;   /* Borders that must read against white */
+  --line: #E7EAF1;
+  --line-strong: #C4CBDA;   /* Borders that must read against white */
+
+  /* Semantic */
+  --good: #0B7D52;
+  --good-bg: #E6FBF3;
+  --good-line: #A6E9CE;
+  --bad: #C81030;
+  --bad-bg: #FDEAEE;
+
+  /* One radius scale and one shadow, so every surface belongs to the same set */
+  --r-sm: 6px;
+  --r-md: 10px;
+  --shadow: 0 1px 2px rgba(16, 26, 51, .04), 0 8px 24px -12px rgba(16, 26, 51, .18);
+  --shadow-pop: 0 12px 32px -8px rgba(1, 41, 172, .22);
 }
 
 * { box-sizing: border-box; }
@@ -30,125 +44,321 @@ body { margin: 0; }
 button, input, select { font: inherit; }
 button { cursor: pointer; }
 button:disabled { opacity: .45; cursor: not-allowed; }
-h1, h2, h3, p { margin: 0; }
+h1, h2, h3, h4, p { margin: 0; }
 /* Brand type: headings are Poppins 600 on pure black; body copy is #2e2e2e. */
 h1, h2, h3, h4, h5, h6 { color: var(--ink); font-weight: 600; }
 
-/* Keyboard focus must always be visible: the checkbox below is a custom
-   control, so the ring is drawn on its adjacent box. */
+/* Keyboard focus must always be visible: several controls here are custom, so
+   the ring is drawn explicitly rather than left to the browser. Text fields and
+   selects are excluded because they draw their own ring below - both at once
+   read as two boxes around one field. */
 :focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+input:focus-visible, select:focus-visible { outline: none; }
 
-main { max-width: 1400px; margin: auto; padding: 0 32px 56px; }
+/* The page is the frame: the bar spans it, the filters sit flush against its
+   left edge and the results take the rest. Nothing floats in a gutter. */
+.app { max-width: 1600px; margin: auto; padding: 0 0 40px; }
 
-/* Topbar */
-.topbar { height: 74px; display: flex; align-items: center; gap: 15px; border-bottom: 1px solid var(--line); }
-/* The logo sits straight on the off-white page, so it uses the blue mark per
-   the brand's background rule. On a blue or black ground switch the src to
-   neutara-logo-white.svg rather than recolouring this one. */
+/* Scrollbars inside the app are noise: the panes they belong to are obviously
+   scrollable from their content. The page keeps its own, which is the one the
+   browser owns and the reader expects. */
+.sidebar, .option-list, .picker, .table { scrollbar-width: none; -ms-overflow-style: none; }
+.sidebar::-webkit-scrollbar, .option-list::-webkit-scrollbar,
+.picker::-webkit-scrollbar, .table::-webkit-scrollbar { width: 0; height: 0; display: none; }
+
+/* Micro-label type: one rule, every uppercase label in the app. */
+label, .table-head, .detail-label, .contact-label, .link-button,
+.sidebar-head h2, .picker-note, .trail-label, .status-badge, .enriched-head h4 {
+  font-family: Poppins, sans-serif; font-weight: 500;
+  text-transform: uppercase; letter-spacing: .07em; font-size: 10px;
+}
+
+/* ── Topbar ───────────────────────────────────────────────────────────────
+   Stays put while the results scroll, so the brand and the Apollo status are
+   never off screen mid-search. */
+.topbar {
+  position: sticky; top: 0; z-index: 30;
+  min-height: 68px; display: flex; align-items: center; gap: 14px;
+  padding: 10px 22px; margin-bottom: 10px;
+  background: var(--page); border-bottom: 1px solid var(--line);
+}
 /* The official mark is portrait (208x284), so height drives the size and the
-   width follows - a fixed square would stretch it, which the logo rules
+   width follows — a fixed square would stretch it, which the logo rules
    forbid. On a blue or black ground swap the src for neutara-mark-white.svg
    rather than recolouring it. */
-.mark { height: 40px; width: auto; flex: none; display: block; }
-h1 { font-size: 17px; }
-.eyebrow, .step, label, .table-head, .detail-label, .contact-label, .link-button { font-family: Poppins, sans-serif; font-weight: 500; text-transform: uppercase; letter-spacing: .07em; font-size: 10px; }
-.eyebrow { color: var(--muted); margin-bottom: 3px; }
-.secure { margin-left: auto; display: inline-flex; align-items: center; gap: 7px; color: #0B7D52; font-size: 11px; font-weight: 600; background: #E6FBF3; border: 1px solid #A6E9CE; padding: 5px 11px; border-radius: 999px; white-space: nowrap; }
+.mark { height: 44px; width: auto; flex: none; display: block; }
+/* Name over tagline as one block: the column keeps their left edges aligned
+   and the tight line-height stops the two lines drifting apart. */
+.brand { display: flex; flex-direction: column; justify-content: center; gap: 2px; min-width: 0; }
+h1 { font-size: 22px; line-height: 1.15; letter-spacing: -.015em; }
+/* The name is the one highlighted element up here, so it carries the brand
+   blue while the tagline stays quiet grey underneath. */
+.brand h1 { color: var(--brand); }
+.tagline { color: var(--muted); font-size: 12px; line-height: 1.3; letter-spacing: .01em; }
+.secure {
+  margin-left: auto; display: inline-flex; align-items: center; gap: 7px;
+  color: var(--good); font-size: 11px; font-weight: 600;
+  background: var(--good-bg); border: 1px solid var(--good-line);
+  padding: 5px 11px; border-radius: 999px; white-space: nowrap;
+}
 .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #0ED380; box-shadow: 0 0 0 3px rgba(14, 211, 128, .20); }
 
-/* Search panel */
-.panel, .results { border-top: 1px solid var(--brand); }
-.search-panel { display: block; padding: 20px 0 24px; }
-.panel-heading, .results-head { display: flex; justify-content: space-between; align-items: start; gap: 20px; margin-bottom: 22px; }
-.panel-heading > div:first-child, .results-head > div:first-child { display: flex; gap: 23px; }
-.step { color: #9AA0AC; padding-top: 4px; }
-h3 { font-size: 17px; margin-bottom: 5px; }
-.heading-bare { justify-content: flex-end; margin-bottom: 12px; }
-.panel-heading p, .results-head p { color: var(--muted); font-size: 12px; }
-.hint { margin-top: 12px; color: var(--muted); font-size: 11px; }
-.req { display: inline-block; margin-left: 7px; color: #FE5833; font-style: normal; font-size: 8px; letter-spacing: .08em; }
+/* ── Workspace: filters left, results right ───────────────────────────────
+   The filters are what a recruiter keeps adjusting, so they hold their place
+   on screen instead of scrolling away above the rows they change. */
+.workspace { display: grid; grid-template-columns: 268px minmax(0, 1fr); align-items: start; }
 
-.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 20px 22px; align-items: start; max-width: 1180px; }
-.field { min-width: 0; }
-/* One fixed label height, so a two-word label and a one-word label still put
-   their inputs on the same line. */
-.field > label { display: block; min-height: 14px; margin-bottom: 6px; }
-label { color: #707070; }
-input, select { display: block; width: 100%; border: 0; border-bottom: 1px solid #C7CDD9; background: transparent; outline: none; color: var(--ink); padding: 11px 0 10px; text-transform: none; letter-spacing: 0; font-family: Poppins, sans-serif; font-size: 14px; }
-input:focus, select:focus { border-color: var(--brand); }
-.search-actions { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--line); }
-.search-actions .hint { margin: 0; }
-.primary { background: var(--brand); color: white; border: 0; border-radius: 4px; padding: 15px 26px; font-weight: 600; font-size: 14px; letter-spacing: .01em; box-shadow: 0 1px 0 rgba(1, 41, 172, .25); }
-.primary:hover:not(:disabled) { background: var(--brand-hover); }
-.primary span, .secondary span { color: var(--accent); margin-left: 18px; font-size: 16px; }
+/* A column of the page rather than a card parked on it: one rule divides it
+   from the results, and it holds the full height beside them. */
+.sidebar {
+  position: sticky; top: 68px;
+  background: var(--surface);
+  border-right: 1px solid var(--line);
+  padding: 18px 22px 18px;
+  /* Its own scroll, so a long picker list never pushes the page down. */
+  height: calc(100vh - 68px); overflow-y: auto; overscroll-behavior: contain;
+}
+.sidebar-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.sidebar-head h2 { color: var(--muted); }
+.link-button { border: 0; background: none; padding: 2px 0; color: var(--brand); text-decoration: underline; text-underline-offset: 3px; }
+.link-button:disabled { color: var(--faint); text-decoration: none; }
 
-.link-button { border: 0; background: none; padding: 3px 0; color: var(--brand); font-weight: 500; text-decoration: underline; text-underline-offset: 3px; }
+.filter-form { display: flex; flex-direction: column; }
+/* Each filter is its own band with a hairline between, so four controls read
+   as four decisions rather than one stack of boxes. */
+.filter-block { position: relative; padding: 15px 0; }
+.filter-block + .filter-block { border-top: 1px solid var(--line); }
+.filter-block > label[for] { display: block; color: var(--muted); margin-bottom: 8px; }
 
-/* Results header stays reachable while scrolling 25 rows. */
-.results { padding-top: 20px; }
-.results-head { position: sticky; top: 0; z-index: 2; background: var(--page); padding: 14px 0 12px; margin-bottom: 12px; border-bottom: 1px solid var(--line); }
-.selection-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
-.selection-actions > span { margin-right: 5px; color: var(--muted); font-size: 12px; }
-.selection-actions button, .pagination button { border: 0; background: none; color: var(--brand); font-size: 11px; padding: 6px 0; }
+.control { position: relative; display: flex; align-items: center; }
+input, select {
+  display: block; width: 100%; min-height: 38px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-sm);
+  background: var(--surface); color: var(--ink);
+  padding: 8px 11px; font-family: Poppins, sans-serif; font-size: 13px;
+  text-transform: none; letter-spacing: 0; outline: none;
+  transition: border-color .12s ease, box-shadow .12s ease;
+}
+.control input { padding-right: 42px; }
+input::placeholder { color: var(--faint); }
+input:hover, select:hover { border-color: var(--brand-light); }
+/* A ring rather than a thicker border, so focus never shifts the layout. */
+input:focus, select:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(1, 41, 172, .12); }
+/* With the list open the field and the list are one control, so the join
+   between them is square and the ring stops at the seam. */
+.control:has(+ .picker) input { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+select { appearance: none; background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%); background-position: calc(100% - 15px) 50%, calc(100% - 10px) 50%; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; padding-right: 30px; cursor: pointer; }
+
+.control-toggle {
+  position: absolute; right: 1px; top: 1px; bottom: 1px; width: 38px;
+  display: flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  /* Big enough to read as the control it is: the chevron is how a recruiter
+     opens the list without typing, so it carries the field's own ink rather
+     than sitting in it as a speck. */
+  background: none; color: var(--muted); font-size: 22px; line-height: 1;
+}
+.control-toggle:hover { color: var(--brand); }
+.control input:focus + .control-toggle { color: var(--brand); }
+
+/* The browser's own datalist cannot be styled, opens at full page height and
+   mixes in autofill history, so the list is ours. */
+.picker {
+  position: absolute; top: 100%; left: 0; right: 0; z-index: 20;
+  /* Pulled up onto the field's own bottom edge, so the two share one line and
+     the list reads as the field continuing rather than a separate slab. */
+  margin: -1px 0 0; padding: 4px; list-style: none;
+  max-height: 288px; overflow-y: auto; overscroll-behavior: contain;
+  background: var(--surface); border: 1px solid var(--brand);
+  border-top-color: var(--line-strong);
+  border-radius: 0 0 var(--r-md) var(--r-md); box-shadow: var(--shadow-pop);
+}
+.picker button {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  width: 100%; text-align: left; border: 0; border-radius: var(--r-sm);
+  background: none; padding: 9px 10px; font-size: 13.5px; color: var(--ink);
+}
+.picker button:hover, .picker button:focus-visible { background: var(--panel); color: var(--brand); outline: none; }
+.picker-note { padding: 7px 9px 5px; color: var(--faint); }
+/* How many of the rows on screen sit in that city — the reason it is offered. */
+.facet-count { font-style: normal; font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; }
+
+/* Chips: a committed filter value, with its own way out. */
+ul.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding-top: 8px; list-style: none; }
+/* The chips are the field's committed values, not a row stuck to its underside:
+   they stand clear of the box above and breathe between themselves, so two
+   rows of them still read as a list. */
+.chips-editable { margin-top: 12px; gap: 7px 8px; padding-left: 1px; }
+.chips-editable li { display: inline-flex; align-items: stretch; border: 1px solid var(--good-line); background: var(--good-bg); border-radius: 999px; overflow: hidden; }
+.chips-editable .chip-static { padding: 5px 3px 5px 12px; font-size: 12.5px; font-weight: 600; color: var(--good); }
+.chips-editable .chip-remove { border: 0; background: none; color: #4F7A6B; padding: 4px 11px 5px 6px; font-size: 15px; line-height: 1; }
+.chips-editable .chip-remove:hover { color: var(--bad); background: var(--bad-bg); }
+.chips-editable button:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }
+
+/* A block whose control is a list of ticks rather than a field. */
+.block-label { display: block; font-family: Poppins, sans-serif; font-weight: 500; text-transform: uppercase; letter-spacing: .07em; font-size: 10px; color: var(--muted); margin-bottom: 8px; }
+.option-list { list-style: none; margin: 0; padding: 0; max-height: 216px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+.option {
+  display: flex; align-items: center; gap: 9px;
+  padding: 6px 6px 6px 4px; border-radius: var(--r-sm);
+  font-size: 13px; font-weight: 400; text-transform: none; letter-spacing: 0;
+  color: var(--body); cursor: pointer;
+}
+.option:hover { background: var(--panel); }
+.option:has(input:checked) { color: var(--brand); font-weight: 600; }
+.option input[type="checkbox"] { flex: none; width: 15px; height: 15px; min-height: 0; padding: 0; margin: 0; accent-color: var(--brand); cursor: pointer; }
+/* The name takes the room, so the count always sits on the right edge. */
+.option-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Searches the list and adds to it, so it leads the block and the list hangs
+   directly off its bottom edge as one control. */
+.option-search { min-height: 34px; font-size: 12.5px; margin-bottom: 8px; }
+.option-search::placeholder { font-size: 12px; }
+
+.filter-note { margin-top: 8px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.filter-toggle {
+  display: flex; align-items: center; gap: 9px;
+  margin-top: 12px; padding: 3px 0;
+  color: var(--muted); font-size: 11.5px; line-height: 1.35;
+  text-transform: none; letter-spacing: 0; font-weight: 400; cursor: pointer;
+}
+.filter-toggle:hover { color: var(--body); }
+/* The global `input { width: 100% }` above is meant for the text fields. Left
+   unchecked it stretches a checkbox across the row. */
+.filter-toggle input[type="checkbox"] { flex: none; width: 15px; height: 15px; min-height: 0; padding: 0; margin: 0; accent-color: var(--brand); cursor: pointer; }
+.sidebar-foot { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--faint); font-size: 11px; line-height: 1.5; }
+
+/* ── Results ──────────────────────────────────────────────────────────────── */
+.results-pane { min-width: 0; padding: 0 22px; }
+.results-head {
+  position: sticky; top: 68px; z-index: 10;
+  display: flex; justify-content: space-between; align-items: center; gap: 20px;
+  background: var(--page); padding: 14px 0 13px; margin-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+.results-head h3 { font-size: 16px; align-self: center; }
+.selection-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+.selection-actions > * { flex: none; }
+.selection-actions > span { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.selection-actions button { border: 0; background: none; color: var(--brand); font-size: 11px; padding: 6px 2px; }
 /* Reveal spends extra Apollo credits, so it reads as a deliberate second
    action: outlined rather than filled, never mistaken for Enrich. */
-/* The spend confirmation. Deliberately not styled as an error: it is a normal
-   step, but one the recruiter must read before money leaves the account. */
-.notice.confirm { border: 1px solid var(--brand); background: #E1ECFF; }
-.notice.confirm p { margin: 0 0 12px; }
-.confirm-actions { display: flex; align-items: center; gap: 16px; }
-.reveal { border: 1px solid var(--brand) !important; color: var(--brand) !important; padding: 11px 14px !important; font-weight: 600; font-size: 12px !important; }
-.reveal:disabled { opacity: .45; }
-.enriched-actions { display: flex; align-items: center; gap: 16px; }
-.search-scope { margin-bottom: 14px; }
-.filter-toggle { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; cursor: pointer; }
-/* The global `input { width: 100% }` above is meant for the text fields. Left
-   unchecked it stretches these checkboxes across the row and pushes their label
-   to the far edge, so they are pinned back to their natural size here. */
-.filter-toggle input[type="checkbox"] { display: inline-block; flex: none; width: 14px; height: 14px; padding: 0; margin: 0; }
-.filter-toggle input { accent-color: var(--brand); }
-.secondary { background: var(--brand-hover) !important; color: white !important; padding: 12px 15px !important; font-weight: 600; font-size: 12px !important; margin-left: 4px; }
+.reveal { display: inline-flex; align-items: center; height: 36px; border: 1px solid var(--brand) !important; border-radius: var(--r-sm); color: var(--brand) !important; padding: 0 14px !important; font-weight: 600; font-size: 11.5px !important; background: var(--surface) !important; }
+.reveal:hover:not(:disabled) { background: var(--panel) !important; }
+.secondary { display: inline-flex; align-items: center; height: 36px; background: var(--brand) !important; color: #fff !important; border-radius: var(--r-sm); padding: 0 15px !important; font-weight: 600; font-size: 11.5px !important; }
+.secondary:hover:not(:disabled) { background: var(--brand-hover) !important; }
+.secondary span { color: var(--accent); margin-left: 8px; }
 
-/* Six columns fit a 1366px laptop with no sideways scroll. */
-.table { overflow-x: auto; }
-.table-head, .candidate-row { min-width: 820px; display: grid; grid-template-columns: 30px 1.5fr 1fr .9fr 1.5fr 1fr; align-items: start; gap: 14px; }
-.table-head { color: var(--muted); border-bottom: 1px solid var(--line); padding: 10px 12px; font-size: 9px; }
-.candidate-block { border-bottom: 1px solid var(--line); min-width: 820px; }
+.hint { color: var(--muted); font-size: 11.5px; line-height: 1.55; }
+.spend-note { margin: 0 0 12px; max-width: 78ch; }
+.hint strong { color: var(--ink); }
+
+/* One row: how big the pool is, and the way to find one person inside it. The
+   box narrows the rows already loaded and sends nothing to Apollo until Enter. */
+.row-search { display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap; margin: 0 0 14px; }
+.pool-size { font-size: 14px; font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
+.row-search label { display: flex; align-items: center; gap: 12px; margin-left: auto; color: var(--muted); }
+.name-search { position: relative; display: flex; align-items: center; }
+/* WebKit puts its own clear button inside a type="search" field on hover. Ours
+   is already there and does more - it drops the name filter as well as the text
+   - so the browser's is switched off rather than shown beside it. */
+.name-search input::-webkit-search-cancel-button,
+.name-search input::-webkit-search-decoration { -webkit-appearance: none; appearance: none; display: none; }
+.row-search input { width: 360px; max-width: 100%; padding-right: 66px; font-size: 12.5px; }
+/* Both controls live inside the field: the cross clears it, the magnifier runs
+   the search Enter runs. Neither is on screen while the box is idle and empty,
+   so an untouched box reads as a box. */
+.box-button {
+  position: absolute; top: 3px; bottom: 3px; width: 30px;
+  display: flex; align-items: center; justify-content: center;
+  border: 0; border-radius: var(--r-sm); background: none; color: var(--muted);
+}
+.box-button:hover:not(:disabled) { color: var(--brand); background: var(--panel); }
+.box-button:disabled { opacity: .35; }
+.box-clear { right: 33px; font-size: 19px; line-height: 1; }
+.search-go { right: 3px; }
+.row-search .link-button { flex: none; }
+.row-search .hint { width: 100%; margin-top: 2px; }
+
+/* Present for a screen reader, absent for everybody else: the placeholder says
+   what the box is, so a visible label would be the same words twice. */
+.visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; border: 0; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; }
+
+/* Six columns fit a 1366px laptop with the sidebar beside them. */
+.table { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-md); box-shadow: var(--shadow); }
+/* Four things worth a column: who, where they work, how to reach them, and
+   whatever the row can do next. Location and enrichment state were columns of
+   mostly "Not available" and mostly "Not enriched" - both now appear only where
+   they say something. */
+.table-head, .candidate-row { min-width: 680px; display: grid; grid-template-columns: 34px minmax(0, 1.7fr) minmax(0, 1.1fr) minmax(0, 1.7fr) 96px; align-items: start; gap: 16px; }
+/* The head labels the columns and stays where the columns start. It was sticky
+   and pinned to the viewport, which pulled it out of the table and dropped it
+   across the middle of the rows on any scroll - a header has no business
+   floating over the data it names. */
+.table-head {
+  color: var(--brand); background: #EFF4FF;
+  border-bottom: 1px solid var(--line);
+  padding: 12px 16px; font-size: 9.5px; font-weight: 600;
+  border-radius: var(--r-md) var(--r-md) 0 0;
+}
+.candidate-block { border-bottom: 1px solid var(--line); min-width: 680px; }
+.candidate-block:last-child { border-bottom: 0; }
 .candidate-block:hover { background: #F7FAFF; }
-.candidate-row { padding: 16px 12px; font-size: 12px; }
-.identity strong { font-size: 13px; }
+/* The row is the checkbox, so it says so: it takes the pointer, and a selected
+   one is marked down its leading edge rather than by a tick alone. */
+.candidate-row { padding: 15px 16px; font-size: 12.5px; line-height: 1.5; cursor: pointer; }
+/* Every column starts on the same line as the name, so a two-line title or a
+   wrapped company never drags its neighbours out of step. */
+.candidate-row > div { padding-top: 1px; }
+.candidate-block.is-selected { background: #F2F7FF; box-shadow: inset 3px 0 0 var(--brand); }
+.candidate-block.is-selected:hover { background: #EAF2FF; }
+.identity strong { font-size: 13.5px; }
+.identity { display: flex; flex-direction: column; align-items: flex-start; gap: 0; }
 .identity strong, .identity span { display: block; }
-.identity span { color: var(--muted); margin-top: 4px; font-size: 11px; }
+.identity > span { color: var(--muted); margin-top: 4px; font-size: 11.5px; line-height: 1.4; }
 .candidate-row a { color: var(--brand); font-weight: 500; text-decoration: underline; text-underline-offset: 3px; }
-.muted { color: #9AA0AC; }
-.available { color: #0B7D52; }
+.muted { color: var(--faint); }
+.available { color: var(--good); }
+/* Which of the requested skills a candidate actually matched. */
+.matched-skills { display: flex; flex-wrap: wrap; gap: 4px; list-style: none; padding: 0; margin: 5px 0 0; }
+.matched-skills li { font-size: 10px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--good-line); background: var(--good-bg); color: var(--good); }
 
 /* Contact stack: label plus value, so a column of "Not available" still reads
    as structured data rather than a wall of nothing. */
-.contact-line { display: flex; gap: 8px; align-items: baseline; padding: 1px 0; }
-.contact-label { flex: none; width: 46px; color: var(--muted); font-size: 9px; padding-top: 1px; }
+.contact-line { display: flex; gap: 10px; align-items: baseline; padding: 2px 0; }
+/* Wide enough for "Work email" on one line: wrapping it turned every contact
+   block into a ragged two-column stack. */
+.contact-label { flex: none; width: 62px; color: var(--muted); font-size: 9px; padding-top: 3px; }
 .contact-line > a, .contact-line > span:not(.contact-label) { min-width: 0; overflow-wrap: anywhere; }
 
 /* Checkbox: visually hidden, never display:none, so it keeps focus and stays
    reachable by keyboard and screen reader. */
-.check { display: block; padding-top: 1px; }
+/* On the name's line, not the row's top edge. */
+.check { display: block; padding-top: 3px; }
 .check input { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; border: 0; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; }
-.check span { display: block; width: 15px; height: 15px; border: 1px solid #B4BCCB; background: white; }
-.check input:checked + span { background: var(--brand); border-color: var(--brand); box-shadow: inset 0 0 0 3px var(--page); }
+.check span { display: block; width: 15px; height: 15px; border: 1px solid var(--line-strong); border-radius: 3px; background: white; }
+.check input:checked + span { background: var(--brand); border-color: var(--brand); box-shadow: inset 0 0 0 3px var(--surface); }
 .check input:focus-visible + span { outline: 2px solid var(--brand); outline-offset: 2px; }
-.check input:disabled + span { border-color: #E3E6EC; background: #F1F1F1; }
+.check input:disabled + span { border-color: var(--line); background: #F1F1F1; }
 
 /* Enrichment status */
-.enriched-cell { display: flex; flex-direction: column; align-items: start; gap: 5px; }
-.status-badge { display: inline-block; padding: 3px 8px; font-family: Poppins, sans-serif; font-size: 9px; text-transform: uppercase; letter-spacing: .06em; border: 1px solid var(--line); color: var(--muted); background: white; }
-.state-enriched .status-badge { color: #0B7D52; border-color: #A6E9CE; background: #E6FBF3; }
-.state-failed .status-badge { color: #C81030; border-color: #F5BDC8; background: #FDEAEE; }
-.state-enriching .status-badge { color: #50596B; border-color: #E3E6EC; background: var(--panel); }
+/* Whatever the row can do next, right-aligned so the column reads as a rail of
+   actions rather than a fifth field. */
+.row-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; text-align: right; }
+.status-badge { display: inline-block; margin-top: 7px; padding: 3px 8px; border-radius: 999px; font-size: 9px; border: 1px solid var(--line); color: var(--muted); background: var(--surface); }
+/* The badge carries its own state now that it sits under the name rather than
+   in a column of its own. */
+.status-badge.state-enriched { color: var(--good); border-color: var(--good-line); background: var(--good-bg); }
+.status-badge.state-failed { color: var(--bad); border-color: #F5BDC8; background: var(--bad-bg); }
+.status-badge.state-enriching, .status-badge.state-revealing,
+.status-badge.state-searching_sources,
+.status-badge.state-revealing_phone { color: #3E4A63; border-color: var(--brand-light); background: var(--panel); }
 
 /* Enriched details */
-.enriched-details { background: var(--panel); border-top: 1px solid var(--line); padding: 20px 12px 24px; }
+.enriched-details { background: #F7F9FE; border-top: 1px solid var(--line); padding: 18px 14px 22px; }
 .enriched-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
-.enriched-head h4 { margin: 0; font-family: Poppins, sans-serif; font-size: 10px; text-transform: uppercase; letter-spacing: .07em; color: var(--brand); }
+.enriched-head h4 { color: var(--brand); }
+.enriched-actions { display: flex; align-items: center; gap: 16px; }
 .detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px 28px; }
 .detail-field { min-width: 0; }
 .detail-label { display: block; color: var(--muted); font-size: 9px; margin-bottom: 6px; }
@@ -158,187 +368,94 @@ input:focus, select:focus { border-color: var(--brand); }
 ul.plain { margin: 0; padding: 0; list-style: none; }
 ul.plain li { padding: 1px 0; }
 .dates { color: var(--muted); }
-ul.chips { display: flex; flex-wrap: wrap; gap: 5px; margin: 0; padding: 0; list-style: none; }
-ul.chips li { border: 1px solid var(--brand-light); background: var(--panel); color: var(--brand); padding: 3px 8px; font-size: 11px; }
+.detail-value ul.chips li { border: 1px solid var(--brand-light); background: var(--panel); color: var(--brand); padding: 3px 9px; border-radius: 999px; font-size: 11px; }
 
-/* Notices and loading */
-.notice { padding: 12px 14px; margin-bottom: 14px; font-size: 12px; }
-.notice.error { background: #FDEAEE; color: #C81030; }
-.notice.info { background: var(--panel); color: #50596B; }
-.notice.success { background: #E6FBF3; color: #0B7D52; }
-.skeleton-row { display: grid; grid-template-columns: 1.5fr 1fr .9fr 1.5fr; gap: 14px; padding: 18px 12px; border-bottom: 1px solid var(--line); }
-.bar { display: block; height: 9px; background: linear-gradient(90deg, #E6E9EF 25%, #E1ECFF 50%, #E6E9EF 75%); background-size: 300% 100%; animation: shimmer 1.3s linear infinite; }
-.bar.wide { height: 11px; }
-@keyframes shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+/* Notices: a coloured rule on the leading edge makes severity scannable
+   without turning the whole block into a slab of colour. */
+.notice { padding: 11px 14px; margin-bottom: 14px; font-size: 12px; line-height: 1.55; border-radius: var(--r-sm); border-left: 3px solid transparent; }
+.notice.error { background: var(--bad-bg); color: var(--bad); border-left-color: var(--bad); }
+.notice.info { background: var(--panel); color: #3E4A63; border-left-color: var(--brand-light); }
+.notice.success { background: var(--good-bg); color: var(--good); border-left-color: var(--good); }
+/* The spend confirmation. Deliberately not styled as an error: it is a normal
+   step, but one the recruiter must read before money leaves the account. */
+.notice.confirm { border: 1px solid var(--brand); border-left: 3px solid var(--brand); background: var(--panel); }
+.notice.confirm p { margin: 0 0 12px; }
+.confirm-actions { display: flex; align-items: center; gap: 16px; }
+
+/* Nothing on screen yet is a state worth designing, not a blank column. */
+.empty-state { border: 1px dashed var(--line-strong); border-radius: var(--r-md); background: var(--surface); padding: 48px 28px; text-align: center; color: var(--muted); }
+.empty-title { color: var(--ink); font-weight: 600; font-size: 14px; margin-bottom: 6px; }
+.empty-state p:last-child { font-size: 12px; max-width: 46ch; margin: 0 auto; line-height: 1.6; }
+
+/* The record of searches already run, so the effect of adding a skill is
+   visible rather than remembered. Nothing here sends a request. */
+.refine-trail { margin: 0 0 14px; }
+.trail-label { display: block; color: var(--muted); margin-bottom: 7px; }
+.refine-trail ol { display: flex; flex-wrap: wrap; gap: 6px 14px; list-style: none; padding: 0; margin: 0; }
+.refine-trail li { font-size: 11px; color: var(--muted); }
+.refine-trail li b { color: var(--ink); font-size: 12px; font-variant-numeric: tabular-nums; }
+.refine-trail li.is-empty b { color: var(--bad); }
+.refine-trail li em { font-style: normal; color: var(--faint); }
+
+/* Loading. The skeleton stands in for rows that are on their way, so it sits
+   where the rows will be rather than shifting the page when they arrive. */
+.skeleton { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-md); overflow: hidden; }
+.skeleton-row { display: grid; grid-template-columns: 1.5fr 1fr .9fr 1.5fr; gap: 14px; padding: 17px 14px; border-bottom: 1px solid var(--line); }
+.skeleton-row:last-child { border-bottom: 0; }
+.bar { display: block; height: 10px; border-radius: 3px; background: linear-gradient(90deg, #E9ECF3 25%, #F3F6FD 37%, #E9ECF3 63%); background-size: 400% 100%; animation: shimmer 1.4s ease infinite; }
+.bar.wide { height: 12px; }
+@keyframes shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
 @media (prefers-reduced-motion: reduce) { .bar { animation: none; } }
 
-.pagination { display: flex; justify-content: center; gap: 26px; padding: 22px 0 5px; align-items: center; font-size: 12px; }
-footer { border-top: 1px solid var(--line); margin-top: 44px; padding-top: 18px; color: var(--muted); font-size: 11px; }
+.pagination { display: flex; align-items: center; justify-content: center; gap: 22px; padding: 20px 0 4px; font-size: 12px; }
+.pagination button { border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--surface); color: var(--brand); padding: 7px 13px; font-size: 11.5px; }
+.pagination button:hover:not(:disabled) { border-color: var(--brand); background: var(--panel); }
+.pagination b { font-variant-numeric: tabular-nums; }
 
-/* Under 900px the table becomes one card per candidate: no sideways scroll,
-   every value labelled. */
-@media (max-width: 900px) {
-  main { padding: 0 20px 35px; }
-  .secure { display: none; }
-  .panel-heading, .results-head { display: block; }
+/* ── Responsive ───────────────────────────────────────────────────────────
+   Below 1024px the sidebar stops being a column and becomes the block above
+   the results, still sticky-free and still four controls in a row where they
+   fit. */
+@media (max-width: 1240px) {
+  .detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 1024px) {
+  .workspace { grid-template-columns: 1fr; }
+  .sidebar { position: static; height: auto; overflow: visible; border-right: 0; border-bottom: 1px solid var(--line); padding: 12px 18px 18px; }
+  .results-pane { padding-top: 4px; }
+  .filter-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0 20px; }
+  .filter-block + .filter-block { border-top: 0; }
   .results-head { position: static; }
-  .selection-actions { margin-top: 18px; }
-  .form-grid { grid-template-columns: 1fr; gap: 16px; }
+}
+
+@media (max-width: 760px) {
+  .app { padding: 0 0 36px; }
+  .topbar { position: static; min-height: 0; flex-wrap: wrap; gap: 12px; padding: 12px 16px; }
+  .sidebar { padding: 12px 16px 16px; }
+  .results-pane { padding: 0 16px; }
+  h1 { font-size: 19px; }
+  .tagline { font-size: 11px; }
+  .secure { margin-left: 0; order: 3; width: 100%; justify-content: center; }
+  .filter-form { grid-template-columns: 1fr; }
+  .results-head { display: block; }
+  .selection-actions { margin-top: 14px; justify-content: flex-start; }
+  .reveal, .secondary { flex: 1 1 auto; text-align: center; }
   .detail-grid { grid-template-columns: 1fr; gap: 16px; }
-  .table { overflow-x: visible; }
+  .row-search { display: block; }
+  .row-search label { margin-left: 0; margin-top: 10px; }
+  .row-search input { width: 100%; }
+
+  /* The table becomes one card per candidate: no sideways scroll, every value
+     labelled. */
+  .table { overflow-x: visible; border: 0; background: none; box-shadow: none; }
   .table-head { display: none; }
-  .candidate-block { min-width: 0; border: 1px solid var(--line); background: white; margin-bottom: 12px; }
+  .candidate-block { min-width: 0; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface); margin-bottom: 12px; overflow: hidden; }
   .candidate-row { display: block; min-width: 0; position: relative; padding: 16px 16px 16px 44px; }
   .check { position: absolute; left: 16px; top: 18px; }
   .identity { margin-bottom: 12px; }
   .candidate-row > div[data-label] { padding-top: 10px; }
   .candidate-row > div[data-label]::before { content: attr(data-label); display: block; font-family: Poppins, sans-serif; font-size: 9px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); margin-bottom: 4px; }
-  .enriched-details { padding: 18px 16px 20px; }
+  .enriched-details { padding: 16px; }
   .skeleton-row { grid-template-columns: 1fr; gap: 8px; }
 }
-
-/* Two ways into the search: filter a pool, or match one known person. A
-   radiogroup rather than a checkbox, because the modes are exclusive. */
-.mode-switch { display: inline-flex; border: 1px solid var(--line); background: white; margin-bottom: 22px; }
-.mode-option { border: 0; background: none; padding: 9px 15px; color: var(--muted); font-family: Poppins, sans-serif; text-transform: uppercase; letter-spacing: .07em; font-size: 10px; }
-.mode-option + .mode-option { border-left: 1px solid var(--line); }
-.mode-option.is-on { background: var(--brand); color: white; }
-.mode-option:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }
-
-/* Skills are separate terms because Apollo ANDs every keyword: three skills
-   routinely narrow a pool to nothing, so each one must be droppable. */
-.skill-terms { margin: 18px 0 4px; }
-.skill-terms-label { display: block; font-family: Poppins, sans-serif; text-transform: uppercase; letter-spacing: .07em; font-size: 10px; color: var(--muted); margin-bottom: 8px; }
-.chips-editable { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; padding: 0; margin: 0; }
-.chips-editable li { display: inline-flex; align-items: stretch; border: 1px solid var(--line); background: white; }
-.chips-editable .chip-toggle, .chips-editable .chip-remove { border: 0; background: none; font-size: 11px; color: var(--ink); padding: 5px 9px; }
-.chips-editable .chip-remove { border-left: 1px solid var(--line); color: var(--muted); padding: 5px 8px; }
-.chips-editable .chip-on { border-color: #A6E9CE; background: #E6FBF3; }
-.chips-editable .chip-on .chip-toggle { color: #0B7D52; font-weight: 700; }
-.chips-editable .chip-off .chip-toggle { color: #9AA0AC; text-decoration: line-through; }
-.chips-editable button:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }
-
-/* The record of searches already run, so the effect of adding a skill is
-   visible rather than remembered. Nothing here sends a request. */
-.refine-trail { margin: 16px 0 4px; }
-.refine-trail ol { display: flex; flex-wrap: wrap; gap: 6px 14px; list-style: none; padding: 0; margin: 0; }
-.refine-trail li { font-size: 11px; color: var(--muted); }
-.refine-trail li b { color: var(--ink); font-size: 12px; }
-.refine-trail li.is-empty b { color: #C81030; }
-
-/* Narrows the rows already loaded. Local only: it sends nothing to Apollo. */
-.row-search { margin: 4px 0 16px; }
-.row-search label { display: flex; align-items: center; gap: 12px; }
-.row-search input { flex: 1; max-width: 420px; border: 1px solid var(--line); background: white; padding: 8px 10px; font-size: 12px; font-family: inherit; }
-.row-search input:focus-visible { outline: 2px solid var(--brand); outline-offset: -1px; }
-.row-search .hint { margin-top: 8px; }
-.row-search-actions { display: flex; align-items: center; gap: 16px; margin-top: 10px; }
-.row-search .hint strong { color: var(--ink); }
-.name-scope { margin-top: 12px; }
-.scope-field { margin-bottom: 14px; }
-.scope-field .search-scope { margin-bottom: 0; }
-.scope-field .hint { margin-top: 6px; max-width: 62ch; }
-.refine-trail li em { font-style: normal; color: #9AA0AC; }
-.row-search label { flex-wrap: wrap; }
-.row-search .link-button { flex: none; }
-.spend-note { margin: 0 0 14px; max-width: 70ch; }
-.trail-label { display: block; font-family: Poppins, sans-serif; text-transform: uppercase; letter-spacing: .07em; font-size: 10px; color: var(--muted); margin-bottom: 8px; }
-/* Which of the requested skills a candidate actually matched. */
-.matched-skills { display: flex; flex-wrap: wrap; gap: 5px; list-style: none; padding: 0; margin: 4px 0 0; }
-.matched-skills li { font-size: 10px; padding: 2px 6px; border: 1px solid #A6E9CE; background: #E6FBF3; color: #0B7D52; }
-.skills-mode { margin: 14px 0 4px; }
-
-/* Role suggestions. The browser's own datalist cannot be styled, opens at full
-   page height and mixes in autofill history, so the list is ours. */
-.form-grid .field { position: relative; display: flex; flex-direction: column; }
-.role-toggle { position: absolute; right: 0; bottom: 6px; border: 0; background: none; color: var(--muted); font-size: 12px; padding: 4px 6px; line-height: 1; }
-.role-toggle:hover { color: var(--ink); }
-.role-list { position: absolute; top: 100%; left: 0; right: 0; z-index: 5; margin: 2px 0 0; padding: 4px; list-style: none; max-height: 232px; overflow-y: auto; background: white; border: 1px solid var(--line-strong, #B4BCCB); box-shadow: 0 6px 18px rgba(1, 41, 172, .12); }
-.role-list li + li { border-top: 1px solid #F1F1F1; }
-.role-list button { display: block; width: 100%; text-align: left; border: 0; background: none; padding: 7px 9px; font-size: 12px; font-family: inherit; color: var(--ink); }
-.role-list button:hover, .role-list button:focus-visible { background: #E6FBF3; color: #0B7D52; outline: none; }
-
-.role-list-note { padding: 6px 9px; font-family: Poppins, sans-serif; font-size: 9px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); border-bottom: 1px solid var(--line); }
-.location-chips { margin-top: 8px; }
-.chips-editable .chip-static { padding: 5px 9px; font-size: 11px; color: #0B7D52; font-weight: 700; }
-
-/* ---------------------------------------------------------------------------
-   Polish layer: hierarchy, multi-value chips, states, responsiveness.
-   Kept at the end so it reads as one pass rather than being scattered through
-   the rules above.
-   --------------------------------------------------------------------------- */
-
-/* Multi-value fields. Skills and Location both hold a list, so both show it as
-   removable chips: a comma-separated string is punctuation, not a list. */
-.skill-chips, .location-chips { margin-top: 9px; }
-.chips-editable .chip-on { border-color: #A6E9CE; background: #E6FBF3; }
-.chips-editable .chip-static { padding: 4px 4px 4px 9px; font-size: 11px; font-weight: 600; color: #0B7D52; }
-.chips-editable .chip-remove { border-left: 1px solid #A6E9CE; color: #4F7A6B; padding: 4px 8px; font-size: 13px; line-height: 1; }
-.chips-editable .chip-remove:hover { color: #C81030; background: #FDEAEE; }
-
-/* Field pickers sit above everything that follows them. */
-.role-list { border-radius: 4px; }
-
-/* Results header: the count is the headline, the actions are secondary. */
-.results-head h3 { font-size: 16px; }
-.results-head p { font-size: 12px; }
-.selection-actions { gap: 12px; }
-.selection-actions > span { font-variant-numeric: tabular-nums; }
-
-/* Spend buttons carry their price, so they need room to breathe and a clear
-   difference between the two paid actions and the free one. */
-.reveal { border-radius: 4px; }
-.reveal:hover:not(:disabled) { background: #E1ECFF !important; }
-.secondary { border-radius: 4px; }
-
-/* Notices: a coloured rule on the leading edge makes severity scannable
-   without turning the whole block into a slab of colour. */
-.notice { border-left: 3px solid transparent; border-radius: 4px; line-height: 1.55; }
-.notice.error { border-left-color: #C81030; }
-.notice.info { border-left-color: #809EFC; }
-.notice.success { border-left-color: #0B7D52; }
-.notice.confirm { border-left: 3px solid var(--brand); }
-
-/* Loading. The skeleton stands in for rows that are on their way, so it sits
-   where the rows will be rather than shifting the page when they arrive. */
-.skeleton { padding: 6px 0; }
-.skeleton-row { display: grid; grid-template-columns: 1.5fr 1fr .9fr 1.5fr; gap: 14px; padding: 16px 12px; border-bottom: 1px solid var(--line); }
-.bar { display: block; height: 10px; border-radius: 2px; background: linear-gradient(90deg, #E6E9EF 25%, #F0F4FD 37%, #E6E9EF 63%); background-size: 400% 100%; animation: shimmer 1.4s ease infinite; }
-.bar.wide { height: 12px; }
-@keyframes shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
-@media (prefers-reduced-motion: reduce) { .bar { animation: none; } }
-
-/* Pagination reads as navigation, not as three stray links. */
-.pagination { display: flex; align-items: center; justify-content: center; gap: 22px; padding: 22px 0 4px; font-size: 12px; }
-.pagination b { font-variant-numeric: tabular-nums; }
-
-footer { margin-top: 34px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
-
-/* Responsive. The table keeps its own horizontal scroll; everything else
-   reflows rather than shrinking. */
-@media (max-width: 1100px) {
-  .detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-
-@media (max-width: 760px) {
-  main { padding: 0 18px 40px; }
-  .topbar { height: auto; flex-wrap: wrap; gap: 12px; padding: 14px 0; }
-  .secure { margin-left: 0; order: 3; width: 100%; justify-content: center; }
-  .form-grid { grid-template-columns: 1fr; gap: 16px; }
-  .search-actions { margin-top: 18px; padding-top: 16px; }
-  .primary { width: 100%; justify-content: center; }
-  .results-head { position: static; }
-  .selection-actions { gap: 10px; }
-  .reveal, .secondary { flex: 1 1 auto; text-align: center; }
-  .detail-grid { grid-template-columns: 1fr; }
-  .row-search label { flex-direction: column; align-items: stretch; gap: 6px; }
-  .row-search input { max-width: none; }
-}
-
-/* The chip row is part of the field, not a floating extra: it hangs directly
-   under its own input and never shifts a neighbouring field. */
-.field .chips-editable { margin-top: 8px; }
-.field input, .field select { min-height: 40px; }
-/* The picker toggle sits on the input's baseline, which moved when the label
-   height was fixed above. */
-.role-toggle { bottom: auto; top: 28px; }

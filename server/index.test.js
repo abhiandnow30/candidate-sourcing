@@ -16,12 +16,17 @@ process.env.APOLLO_WEBHOOK_URL = '';
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const realFetch = globalThis.fetch.bind(globalThis);
 const { default: app } = await import('./index.js');
+const { clearCache } = await import('./store.js');
 
 const ok = (payload) => new Response(JSON.stringify(payload), { status: 200 });
 
 // Boots the app on an ephemeral port and routes only api.apollo.io calls to
 // the stub, so loopback requests to our own server still work.
 async function withServer(apolloHandler, run) {
+  // The store is what the app is for - it survives a restart on purpose - so
+  // each case starts from an empty one rather than inheriting what the case
+  // before it paid for.
+  clearCache();
   const server = app.listen(0);
   await new Promise((resolve) => server.once('listening', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -67,24 +72,38 @@ test('search returns normalized candidates through our backend', async () => {
   });
 });
 
-test('search requires a location and either a role or a skill', async () => {
-  const complete = { jobTitle: 'Java Developer', location: 'Delhi', keywords: 'Java' };
-  await withServer(() => ok({ people: [] }), async ({ post, apolloCalls }) => {
-    const cases = [
-      [{}, ['location', 'jobTitle', 'keywords']],
-      [{ page: 1 }, ['location', 'jobTitle', 'keywords']],
-      [{ ...complete, location: '   ' }, ['location']],
-      // A location on its own describes a city, not a search.
-      [{ location: 'Delhi' }, ['jobTitle', 'keywords']],
-      [{ location: 'Delhi', seniority: 'senior', company: 'Example Co' }, ['jobTitle', 'keywords']]
-    ];
-    for (const [payload, expectedMissing] of cases) {
-      const { status, body } = await post('/api/candidates/search', payload);
-      assert.equal(status, 400, JSON.stringify(payload));
-      assert.equal(body.error, 'Location is required, along with a role or at least one skill.');
-      assert.deepEqual(body.missing, expectedMissing);
+test('a search with no filters at all is the whole pool, not an error', async () => {
+  // The app opens on this: see who is there, then narrow. Every filter here
+  // cuts a pool down rather than creating one, so none of them is a
+  // precondition for asking.
+  await withServer(() => ok({ people: [{ id: 'person-1', name: 'Test Candidate' }], total_entries: 4 }), async ({ post, apolloCalls }) => {
+    const { status, body } = await post('/api/candidates/search', {});
+    assert.equal(status, 200);
+    assert.equal(body.candidates.length, 1);
+    // Nothing is invented to stand in for the filters that were not given.
+    const sent = apolloCalls[0].body;
+    for (const key of ['person_titles', 'person_locations', 'person_seniorities', 'q_keywords']) {
+      assert.equal(key in sent, false, key);
     }
-    assert.equal(apolloCalls.length, 0, 'no credit is spent on a query that cannot be meaningful');
+  });
+});
+
+test('punctuation on its own reaches Apollo as no filter, not as a term', async () => {
+  await withServer(() => ok({ people: [] }), async ({ post, apolloCalls }) => {
+    const { status } = await post('/api/candidates/search', { keywords: ' , , ', location: ' , ' });
+    assert.equal(status, 200);
+    assert.equal('q_keywords' in apolloCalls[0].body, false);
+    assert.equal('person_locations' in apolloCalls[0].body, false);
+  });
+});
+
+test('a role with no location is a search, not an error', async () => {
+  await withServer(() => ok({ people: [{ id: 'person-1', name: 'Test Candidate' }], total_entries: 1 }), async ({ post, apolloCalls }) => {
+    const { status } = await post('/api/candidates/search', { jobTitle: 'Data Scientist' });
+    assert.equal(status, 200);
+    assert.deepEqual(apolloCalls[0].body.person_titles, ['Data Scientist']);
+    // Nothing is invented to stand in for the location that was not given.
+    assert.equal('person_locations' in apolloCalls[0].body, false);
   });
 });
 
@@ -924,13 +943,129 @@ test('no location at all sends no person_locations', async () => {
   });
 });
 
-test('a location list of only separators is still no location', async () => {
+test('a location list of only separators is sent to Apollo as no location', async () => {
   await withServer(() => ok({ people: [] }), async ({ post, apolloCalls }) => {
-    const { status, body } = await post('/api/candidates/search', {
+    const { status } = await post('/api/candidates/search', {
       jobTitle: 'Frontend Developer', location: ' , , '
     });
-    assert.equal(status, 400);
-    assert.deepEqual(body.missing, ['location']);
-    assert.equal(apolloCalls.length, 0);
+    // The role carries the search; the punctuation is simply dropped rather
+    // than sent to Apollo as a place.
+    assert.equal(status, 200);
+    assert.equal('person_locations' in apolloCalls[0].body, false);
   });
+});
+
+// --- What Apollo has already been paid for ----------------------------------
+//
+// Enrichment, a revealed email and a phone number each cost a credit, and each
+// answer is the same the next time it is asked for. The store keeps them, so a
+// candidate looked at again - tomorrow, or after a restart - is paid for once.
+
+const enrichable = (id, name) => ({ id, name, email: `${id}@example.com`, organization: { name: 'Example Co' } });
+
+test('a candidate is enriched once, and served from the store after that', async () => {
+  await withServer(() => ok({ matches: [enrichable('person-1', 'Test Candidate')] }), async ({ post, apolloCalls }) => {
+    const first = await post('/api/candidates/enrich', { ids: ['person-1'] });
+    assert.equal(first.status, 200);
+    assert.equal(apolloCalls.length, 1);
+    assert.deepEqual(first.body.fromCacheIds, []);
+
+    // Same candidate, same answer, no second credit.
+    const second = await post('/api/candidates/enrich', { ids: ['person-1'] });
+    assert.equal(second.status, 200);
+    assert.equal(apolloCalls.length, 1, 'Apollo is not asked again for a candidate already bought');
+    assert.deepEqual(second.body.fromCacheIds, ['person-1']);
+    assert.equal(second.body.candidates[0].name, 'Test Candidate');
+    assert.equal(second.body.candidates[0].fromCache, true);
+  });
+});
+
+test('only the candidates not already held are asked for', async () => {
+  await withServer(({ body }) => ok({
+    matches: (body.details || []).map((detail, index) => enrichable(detail.id, `Person ${index}`))
+  }), async ({ post, apolloCalls }) => {
+    await post('/api/candidates/enrich', { ids: ['person-1'] });
+    const mixed = await post('/api/candidates/enrich', { ids: ['person-1', 'person-2'] });
+
+    assert.equal(apolloCalls.length, 2);
+    // The second call carries person-2 alone: person-1 was already owned.
+    assert.deepEqual(apolloCalls[1].body.details.map((detail) => detail.id), ['person-2']);
+    assert.deepEqual(mixed.body.fromCacheIds, ['person-1']);
+    assert.equal(mixed.body.candidates.length, 2);
+  });
+});
+
+test('refresh buys a new copy rather than being handed the stored one', async () => {
+  await withServer(() => ok({ matches: [enrichable('person-1', 'Test Candidate')] }), async ({ post, apolloCalls }) => {
+    await post('/api/candidates/enrich', { ids: ['person-1'] });
+    const again = await post('/api/candidates/enrich', { ids: ['person-1'], refresh: true });
+
+    assert.equal(apolloCalls.length, 2, 'Refresh from Apollo has to reach Apollo');
+    assert.deepEqual(again.body.fromCacheIds, []);
+  });
+});
+
+test('an enrichment does not answer a reveal, because it never paid for one', async () => {
+  await withServer(() => ok({ matches: [enrichable('person-1', 'Test Candidate')] }), async ({ post, apolloCalls }) => {
+    await post('/api/candidates/enrich', { ids: ['person-1'] });
+    const revealed = await post('/api/candidates/reveal', { ids: ['person-1'] });
+
+    // The stored row holds a work address; a personal one was never bought, so
+    // the reveal is a real request.
+    assert.equal(apolloCalls.length, 2);
+    assert.deepEqual(revealed.body.fromCacheIds, []);
+    assert.equal(apolloCalls[1].body.reveal_personal_emails, true);
+
+    // And the second reveal is free.
+    await post('/api/candidates/reveal', { ids: ['person-1'] });
+    assert.equal(apolloCalls.length, 2);
+  });
+});
+
+test('a search hands back the details this account already owns', async () => {
+  await withServer(({ url }) => {
+    if (url.includes('people/bulk_match')) return ok({ matches: [enrichable('person-1', 'Test Candidate')] });
+    return ok({ people: [{ id: 'person-1', name: 'Test Candidate', title: 'Java Developer' }], total_entries: 1 });
+  }, async ({ post }) => {
+    // Nothing owned yet: the row comes back as any other search row does.
+    const before = await post('/api/candidates/search', { jobTitle: 'Java Developer' });
+    assert.equal(before.body.candidates[0].enriched, false);
+
+    await post('/api/candidates/enrich', { ids: ['person-1'] });
+
+    // Now the same search returns the row already enriched, so the recruiter
+    // opens the details instead of paying to see them again.
+    const after = await post('/api/candidates/search', { jobTitle: 'Java Developer' });
+    assert.equal(after.body.candidates[0].enriched, true);
+    assert.equal(after.body.candidates[0].fromCache, true);
+    assert.equal(after.body.candidates[0].email, 'person-1@example.com');
+    // The search row is the newer statement of the job, so it still wins.
+    assert.equal(after.body.candidates[0].title, 'Java Developer');
+  });
+});
+
+test('an expired record is bought again rather than served stale', async () => {
+  const previous = process.env.CANDIDATE_CACHE_TTL_DAYS;
+  await withServer(() => ok({ matches: [enrichable('person-1', 'Test Candidate')] }), async ({ post, apolloCalls }) => {
+    await post('/api/candidates/enrich', { ids: ['person-1'] });
+    assert.equal(apolloCalls.length, 1);
+
+    // People change jobs and addresses stop working, so a record has a life.
+    process.env.CANDIDATE_CACHE_TTL_DAYS = '0.0000001';
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await post('/api/candidates/enrich', { ids: ['person-1'] });
+    assert.equal(apolloCalls.length, 2);
+  });
+  if (previous === undefined) delete process.env.CANDIDATE_CACHE_TTL_DAYS;
+  else process.env.CANDIDATE_CACHE_TTL_DAYS = previous;
+});
+
+test('the store can be turned off outright', async () => {
+  process.env.CANDIDATE_CACHE = 'off';
+  await withServer(() => ok({ matches: [enrichable('person-1', 'Test Candidate')] }), async ({ post, apolloCalls }) => {
+    await post('/api/candidates/enrich', { ids: ['person-1'] });
+    await post('/api/candidates/enrich', { ids: ['person-1'] });
+    assert.equal(apolloCalls.length, 2, 'nothing is held, so every request is paid for');
+  });
+  delete process.env.CANDIDATE_CACHE;
 });

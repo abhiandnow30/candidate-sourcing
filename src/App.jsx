@@ -2,23 +2,42 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   ENRICHED, ENRICHING, FAILED, NOT_ENRICHED, REVEALING, REVEALING_PHONE,
   applyEnriched, applyStates, applyWaterfall, enrichmentLabel, enrichmentSummary, idsToEnrich, idsToReveal,
-  idsToRevealPhone, markState, reconcile, revealSummary, stateOf
+  idsToRevealPhone, markState, mergeCandidate, reconcile, revealSummary, stateOf
 } from './enrichment.js';
 
 // personName is not one of the form fields: it is driven by the results search
 // box, because that is where a recruiter is when they realise the person they
 // want is on one of the other pages.
 const initialFilters = { jobTitle: '', location: '', seniority: '', keywords: '', personName: '' };
-// Role, skills and location are required; the rest narrow an already
-// meaningful search. Apollo bills for every search, so a query without these
-// three is not worth sending.
-// Location, plus a role or at least one skill. Skills were compulsory, which
-// forced the most destructive filter onto every search.
-const REQUIRED_FILTERS = ['location'];
-const REQUIRED_EITHER = ['jobTitle', 'keywords'];
+// Nothing is required. The app opens on the whole pool and every filter cuts
+// it down, which is the order a recruiter actually works in: see who is there,
+// then narrow. Requiring a role first meant the first screen was empty and the
+// location list had nothing to draw on.
 // Fields holding a comma-separated list, shown as removable chips so the search
 // reads as a list rather than as punctuation.
 const MULTI_VALUE_FIELDS = ['keywords', 'location'];
+const NO_DRAFTS = { keywords: '', location: '' };
+
+// Apollo has no facet endpoint, and - measured against the live API - it
+// returns no location on a search row either, so the cities a search "found"
+// are almost always none. The list therefore starts from the places people are
+// actually hired in, and any city a result does name is added to it. Plain text
+// passed straight to Apollo: this narrows nothing by itself, and the box under
+// the list still takes anything not on it.
+// Cities only. A country belongs here about as much as "anywhere" does:
+// locations are an OR at Apollo, so ticking one beside a city would quietly
+// widen the search to the whole country rather than narrow it. The box under
+// the list still takes a country, a state or a city nobody listed.
+//
+// Visakhapatnam and Vizag are the same place under two names. Both are offered
+// because Apollo matches the text it holds, not the city it means, and profiles
+// there are written either way - ticking both is an OR, so it costs nothing and
+// catches the records the other spelling would miss.
+const LOCATION_SUGGESTIONS = [
+  'Chennai', 'Coimbatore', 'Trivandrum', 'Cochin', 'Bangalore', 'Mangalore',
+  'Hyderabad', 'Visakhapatnam', 'Vizag', 'Bhubaneshwar', 'Pune', 'Mumbai',
+  'Bhopal', 'Noida', 'Kanpur', 'Delhi', 'Gurgaon', 'Kolkata', 'Ahmedabad'
+];
 
 // Commas, not spaces: "Machine Learning" is one skill. De-duplicated to match
 // what the server sends Apollo, so a value typed twice is one filter and not
@@ -26,11 +45,6 @@ const MULTI_VALUE_FIELDS = ['keywords', 'location'];
 function splitList(value) {
   return [...new Set(value.split(',').map((item) => item.trim()).filter(Boolean))];
 }
-const fields = [
-  ['jobTitle', 'Role / Job Title', 'e.g. Data Scientist', false],
-  ['location', 'Location', 'e.g. Hyderabad, Bangalore, Pune', true],
-  ['keywords', 'Skills', 'e.g. Python, LLM, Machine Learning', false],
-];
 
 // Company and Industry were here and are gone, both measured against the live
 // API rather than judged by eye:
@@ -45,7 +59,6 @@ const fields = [
 //   search with no explanation, the same trap the junior seniority was. It
 //   could come back as a validated dropdown; as a text box it could not.
 
-const FIELD_LABELS = Object.fromEntries(fields.map(([name, label]) => [name, label.toLowerCase()]));
 
 // How many past queries to keep in the refine trail. Enough to see which skill
 // narrowed the pool, short enough not to become a wall of numbers.
@@ -168,7 +181,13 @@ function personalEmailOf(candidate) {
 function PersonalEmailStatus({ candidate }) {
   const personal = personalEmailOf(candidate);
   if (personal) return <a href={`mailto:${personal}`}>{personal}</a>;
-  if (candidate.waterfallChecked) return <span className="muted">No personal email found</span>;
+  // A reveal that found nothing is an answer, and a paid one. Saying nothing
+  // left the recruiter looking at the work address they already had, with no
+  // way to tell whether the reveal had failed, been skipped, or simply come
+  // back empty - so a credit was spent and the screen did not change.
+  if (candidate.waterfallChecked || candidate.contactRevealed) {
+    return <span className="muted">Apollo holds no personal email</span>;
+  }
   return <Unavailable />;
 }
 
@@ -188,16 +207,9 @@ function PhoneStatus({ candidate, state }) {
 // for a candidate no search of other sources has touched.
 function showPersonalLine(candidate) {
   if (candidate.emailType === 'personal') return false;
-  return Boolean(candidate.personalEmail) || Boolean(candidate.waterfallChecked);
-}
-
-// Matches a row against the name the recruiter typed. Name only: the box exists
-// to find one candidate, and matching companies or job titles as well meant a
-// company name could pull up people the recruiter was not looking for.
-function matchesRowQuery(candidate, query) {
-  const needle = query.trim().toLowerCase();
-  if (!needle) return true;
-  return typeof candidate.name === 'string' && candidate.name.toLowerCase().includes(needle);
+  return Boolean(candidate.personalEmail)
+    || Boolean(candidate.waterfallChecked)
+    || Boolean(candidate.contactRevealed);
 }
 
 // Our backend always answers with JSON, but a proxy or gateway in front of it
@@ -287,6 +299,7 @@ function EnrichedDetails({ candidate, onRefresh, onReveal, busy, revealing, stat
       </div>
     </div>
     <div className="detail-grid">
+      <DetailField label="Location">{candidate.location ? candidate.location : <Unavailable />}</DetailField>
       <DetailField label="Professional headline">{candidate.headline ? candidate.headline : <Unavailable />}</DetailField>
       <DetailField label="Seniority">{candidate.seniority ? candidate.seniority : <Unavailable />}</DetailField>
       <DetailField label="Department">{departments.length ? departments.join(', ') : <Unavailable />}</DetailField>
@@ -311,8 +324,17 @@ function EnrichedDetails({ candidate, onRefresh, onReveal, busy, revealing, stat
 
 function CandidateBlock({ candidate, selected, selectable, state, expanded, busy, onToggle, onExpand, onRetry, onRefresh, onReveal }) {
   const name = valueOrUnavailable(candidate.name);
-  return <div className="candidate-block">
-    <article className="candidate-row">
+  // The whole row is the checkbox: selecting people is what this table is for,
+  // and hunting a 15px box for every one of 25 rows was the slowest thing on
+  // the page. Anything inside the row that does its own job - a link, a button,
+  // the box itself - is left alone.
+  function selectFromRow(event) {
+    if (!selectable) return;
+    if (event.target.closest('a, button, input, label')) return;
+    onToggle();
+  }
+  return <div className={`candidate-block${selected ? ' is-selected' : ''}`}>
+    <article className="candidate-row" onClick={selectFromRow}>
       <label className="check">
         <input
           type="checkbox"
@@ -329,9 +351,11 @@ function CandidateBlock({ candidate, selected, selectable, state, expanded, busy
         {(candidate.matchedSkills || []).length > 0 && <ul className="matched-skills">
           {candidate.matchedSkills.map((skill) => <li key={skill}>{skill}</li>)}
         </ul>}
+        {/* Only a state worth reporting. "Not enriched" was a column of its own
+            saying nothing: it is the state every row starts in. */}
+        {state !== NOT_ENRICHED && <span className={`status-badge state-${state}`}>{enrichmentLabel(state)}</span>}
       </div>
       <div data-label="Company">{valueOrUnavailable(candidate.company)}</div>
-      <div data-label="Location">{valueOrUnavailable(candidate.location)}</div>
       <div className="contact" data-label="Contact">
         <ContactLine label={emailLabel(candidate)}><ContactValue value={candidate.email} available={candidate.emailAvailable} href={candidate.email ? `mailto:${candidate.email}` : undefined} /></ContactLine>
         {showPersonalLine(candidate) && <ContactLine label="Personal">
@@ -344,8 +368,7 @@ function CandidateBlock({ candidate, selected, selectable, state, expanded, busy
             : <Unavailable />}
         </ContactLine>
       </div>
-      <div className={`enriched-cell state-${state}`} data-label="Enriched">
-        <span className="status-badge">{enrichmentLabel(state)}</span>
+      <div className="row-actions">
         {state === FAILED && <button type="button" className="link-button" onClick={onRetry} disabled={busy}>Retry</button>}
         {state === ENRICHED && <button
           type="button"
@@ -401,6 +424,9 @@ export default function App() {
   // Narrows the rows already on screen. Purely local: it sends nothing to
   // Apollo, so it costs nothing and cannot reach past the loaded page.
   const [rowQuery, setRowQuery] = useState('');
+  // The name box shows its controls only while it is in use: an idle box is a
+  // box, not a toolbar.
+  const [nameFocused, setNameFocused] = useState(false);
   // What each query actually returned, so the effect of adding a skill is
   // visible instead of guessed. This is only ever appended to by a search the
   // recruiter asked for; nothing here triggers a request.
@@ -414,10 +440,72 @@ export default function App() {
   const [matchAllSkills, setMatchAllSkills] = useState(false);
   const [rolesOpen, setRolesOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
+  // What is committed lives in `filters` and goes to Apollo; what is still
+  // being typed lives here and does not, until something commits it. Keeping
+  // the two apart is what lets a chip list be a list rather than a string of
+  // punctuation the recruiter has to edit by hand.
+  const [drafts, setDrafts] = useState(NO_DRAFTS);
   const roleFieldRef = useRef(null);
   const skillFieldRef = useRef(null);
 
   function updateFilter(event) { setFilters({ ...filters, [event.target.name]: event.target.value }); }
+
+  function committedValues(field) { return splitList(filters[field]); }
+
+  // Every filter applies the moment it is committed - a role picked, a chip
+  // added or dropped, a level chosen - which is why there is no Search button
+  // to forget. Typing alone never sends a request: Apollo bills per search, so
+  // a half-typed word must not become one.
+  //
+  // The new filters are passed to search() as overrides because React has not
+  // re-rendered yet, so reading them back off state here would send the
+  // previous value.
+  function applyFilters(next, pending = drafts) {
+    // Whatever is still in a box joins the filters it was typed beside: a skill
+    // typed but never entered is one the recruiter plainly meant to search on,
+    // so it is committed here rather than quietly dropped.
+    const merged = { ...next };
+    for (const field of MULTI_VALUE_FIELDS) {
+      const draft = (pending[field] || '').trim();
+      if (draft) merged[field] = splitList(`${merged[field]}, ${draft}`).join(', ');
+    }
+    setFilters(merged);
+    setDrafts(NO_DRAFTS);
+    // A name filter describes one person and these filters describe a pool, so
+    // committing a pool filter drops it rather than silently ANDing the two.
+    setRowQuery('');
+    search(1, { ...merged, personName: '' });
+  }
+
+  function draftValue(field) { return drafts[field]; }
+
+  // Typing alone commits nothing and searches nothing - except at a comma,
+  // which is how a list is written: everything before the last one becomes a
+  // chip, so a pasted "Hyderabad, Bangalore, Pune" turns into the three values
+  // it describes rather than sitting there as punctuation.
+  function setDraft(field, text) {
+    const cut = text.lastIndexOf(',');
+    if (cut === -1) return setDrafts({ ...drafts, [field]: text });
+    setFilters({ ...filters, [field]: splitList(`${filters[field]}, ${text.slice(0, cut)}`).join(', ') });
+    setDrafts({ ...drafts, [field]: text.slice(cut + 1).replace(/^\s+/, '') });
+  }
+
+  // Enter in a box: commit whatever is in it - in either box - and search on
+  // the result.
+  function commitDraft() {
+    applyFilters({ ...filters });
+  }
+
+  // A value picked from the list, which replaces whatever was half-typed in
+  // that box rather than committing both.
+  function addValue(field, rawValue) {
+    const value = rawValue.trim();
+    if (!value) return;
+    applyFilters(
+      { ...filters, [field]: splitList(`${filters[field]}, ${value}`).join(', ') },
+      { ...drafts, [field]: '' }
+    );
+  }
 
   // Promotes what is typed in the results box into Apollo's own name filter, so
   // the search covers every page instead of the one in hand. It is an explicit
@@ -430,6 +518,14 @@ export default function App() {
     search(1, { personName });
   }
 
+  // The cross inside the box. It clears what was typed, and - if that name is
+  // the filter Apollo is currently applying - drops the filter too, which is a
+  // search back to the pool the recruiter was looking at before.
+  function clearNameBox() {
+    if (filters.personName) return clearNameFilter();
+    setRowQuery('');
+  }
+
   function clearNameFilter() {
     setRowQuery('');
     setFilters({ ...filters, personName: '' });
@@ -440,9 +536,27 @@ export default function App() {
   // adding to it. Several titles still work by typing them with commas, which
   // Apollo ORs - the picker just does not build that list for you.
   function chooseRole(role) {
-    setFilters({ ...filters, jobTitle: role });
     setRolesOpen(false);
+    applyFilters({ ...filters, jobTitle: role });
   }
+
+  // Enter in the role box searches on whatever has been typed, so a title
+  // Apollo knows but the picker does not suggest is still one keystroke away.
+  function commitRole() {
+    setRolesOpen(false);
+    commitDraft();
+  }
+
+  // The pool as it stands, before anything has been asked of it. Runs once:
+  // the ref survives the double-invoke React does in development, which would
+  // otherwise open the app with two identical requests.
+  const openedRef = useRef(false);
+  useEffect(() => {
+    if (openedRef.current) return;
+    openedRef.current = true;
+    search(1, {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (!rolesOpen && !skillsOpen) return undefined;
@@ -456,11 +570,22 @@ export default function App() {
 
   // Skills do accumulate, unlike the role: a search asks about several of them,
   // and each one is its own Apollo request.
-  function chooseSkill(skill) {
-    const parts = filters.keywords.split(',');
-    parts[parts.length - 1] = parts.length > 1 ? ` ${skill}` : skill;
-    setFilters({ ...filters, keywords: `${parts.join(',')}, ` });
+  // Picking a skill finishes that skill: the list closes and the box gives up
+  // focus, so the picker does not spring straight back open over the chip that
+  // was just added. Clicking the box again starts the next one.
+  function chooseSkill(skill, event) {
     setSkillsOpen(false);
+    event?.currentTarget?.closest('.filter-block')?.querySelector('input')?.blur();
+    addValue('keywords', skill);
+  }
+
+  // A location or a level is held as the same comma-separated text as the rest,
+  // so ticking one is adding a value and unticking it is removing one.
+  function toggleValue(field, value) {
+    const current = splitList(filters[field]);
+    const kept = current.filter((entry) => entry.toLowerCase() !== value.toLowerCase());
+    const next = kept.length === current.length ? [...current, value] : kept;
+    applyFilters({ ...filters, [field]: next.join(', ') });
   }
 
   // Drops one location and leaves the others alone. Locations are held as the
@@ -470,38 +595,25 @@ export default function App() {
   // rewrites that text rather than a list.
   function removeValue(field, value) {
     const kept = splitList(filters[field]).filter((entry) => entry !== value);
-    setFilters({ ...filters, [field]: kept.join(', ') });
+    // Dropping a filter is as much a change of question as adding one, so it
+    // re-runs the search instead of leaving the old rows under new chips.
+    applyFilters({ ...filters, [field]: kept.join(', ') });
   }
 
   function resetFilters() {
     setFilters(initialFilters);
+    setDrafts(NO_DRAFTS);
     setRefineTrail([]);
   }
 
   function toggle(id) { const next = new Set(selected); next.has(id) ? next.delete(id) : next.add(id); setSelected(next); }
-  // Merges in whatever enrichment has come back, then applies the filter.
-  // What the box should still narrow locally, which is nothing while it is
-  // showing the name Apollo has already filtered on.
-  //
-  // Apollo matches a name against a first or a last name, where this box
-  // matches the whole string: a search for "Aditya Sai" legitimately returns
-  // people Apollo records as "Sai" or as "Aditya". Applying both filters threw
-  // every one of those away and left the table empty under a count that said
-  // 18 profiles matched.
-  function localRowQuery() {
-    return rowQuery.trim() === filters.personName ? '' : rowQuery;
-  }
-
+  // Every row on the page, with whatever enrichment has come back merged in.
+  // Nothing is hidden locally: the name box asks Apollo about the whole filtered
+  // pool, so hiding rows here as well would have thrown away the answer.
   function shownList() {
-    const merged = candidates.map((candidate) => (candidate.id && enriched.get(candidate.id)) || candidate);
-    // Select all reads this, so a row hidden by the search box is never
-    // selected and never quietly paid for.
-    return merged.filter((candidate) => matchesRowQuery(candidate, localRowQuery()));
+    return candidates.map((candidate) => (candidate.id && enriched.get(candidate.id)) || candidate);
   }
 
-  // Selects only what is on screen: with the filter on, Select all must not
-  // reach hidden candidates and quietly spend credits on them.
-  function selectAll() { setSelected(new Set(shownList().map((candidate) => candidate.id).filter(Boolean))); }
   function clearSelection() { setSelected(new Set()); }
   function toggleExpanded(id) {
     const next = new Set(expanded);
@@ -527,29 +639,27 @@ export default function App() {
   // search anywhere else behaves.
   function queryFor(overrides = {}) {
     const personName = overrides.personName !== undefined ? overrides.personName : filters.personName;
-    // The committed terms plus whatever is still in the box, so a skill the
-    // recruiter typed but did not press Enter on is not silently dropped.
     if (personName) {
       // Location is dropped, and only location. Measured against the live API:
       // a name alone returns tens of thousands of people in unrelated roles,
       // role and skills narrow that to a handful of real matches, and adding
       // location takes it to nothing - because Apollo returns no location on a
       // search row, so a name filtered by one matches almost no record it has.
-      return { ...filters, keywords: filters.keywords, location: '', personName };
+      return { ...filters, ...overrides, location: '', personName };
     }
-    return { ...filters, ...overrides, keywords: filters.keywords, personName: '' };
+    return { ...filters, ...overrides, personName: '' };
   }
 
   // `overrides` carries a filter the recruiter changed in the same click.
   // React has not re-rendered yet at that point, so reading it from state here
   // would send the previous value.
-  async function search(nextPage = 1, overrides = {}) {
+  async function search(nextPage = 1, overrides = {}, matchAll = matchAllSkills) {
     setLoading('search'); setStatus(null); setPage(nextPage);
     const query = queryFor(overrides);
     const keywords = query.keywords;
     const send = () => fetch('/api/candidates/search', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...query, page: nextPage, verifiedEmailOnly, matchAllSkills })
+      body: JSON.stringify({ ...query, page: nextPage, verifiedEmailOnly, matchAllSkills: matchAll })
     });
     try {
       let response = await send();
@@ -560,6 +670,18 @@ export default function App() {
       }
       const data = await readJson(response);
       setCandidates(data.candidates); setTotal(data.total); setSelected(new Set());
+      // Rows the backend served from our own store are already enriched: the
+      // credit was spent on a previous search, so the details open without
+      // asking for it again.
+      const known = data.candidates.filter((candidate) => candidate.enriched && candidate.id);
+      if (known.length) {
+        setEnriched((previous) => {
+          const next = new Map(previous);
+          for (const candidate of known) next.set(candidate.id, mergeCandidate(next.get(candidate.id), candidate));
+          return next;
+        });
+        setStates((previous) => markState(previous, known.map((candidate) => candidate.id), ENRICHED));
+      }
       setPerPage(data.perPage || DEFAULT_PER_PAGE);
       setLastSkillTotals(data.skillTotals || []);
       setMatchedAll(data.matchedAllSkills === true);
@@ -607,30 +729,33 @@ export default function App() {
     finally { setLoading(''); }
   }
 
+  // Enter anywhere in the filter form. Every field commits its own value on
+  // Enter, so this only has to catch the case where nothing did.
   function submitSearch(event) {
     event.preventDefault();
-    // Apollo bills for every search, so refuse one that cannot be meaningful.
-    if (!canSearch) {
-      return setStatus({ type: 'error', text: 'A location is required, along with a role or at least one skill.' });
-    }
-    // Describing a pool is the opposite question to naming a person, so a live
-    // name filter is dropped rather than silently ANDed onto the new search.
-    // The box is cleared with it: a name left sitting there would go on hiding
-    // rows locally, and the fresh pool would come back looking empty.
-    if (filters.personName) setFilters({ ...filters, personName: '' });
-    setRowQuery('');
-    search(1, { personName: '' });
+    applyFilters({ ...filters, personName: '' });
+  }
+
+  // Switching between "any of these skills" and "all of them" is a different
+  // question about the same filters, so it re-runs the search on the value it
+  // just set rather than the one React has yet to apply.
+  function toggleMatchAllSkills() {
+    const next = !matchAllSkills;
+    setMatchAllSkills(next);
+    search(1, { personName: '' }, next);
   }
 
   // Enrich and reveal post the same body to backend routes that answer in the
   // same shape. They differ in the state a row shows while in flight and, on
   // the backend, in whether Apollo was asked to spend credits on contact data.
-  async function runEnrichment({ path, requested, busyKey, inFlightState, summarize, failureText, restoreOnError = false, notice = '' }) {
+  async function runEnrichment({ path, requested, busyKey, inFlightState, summarize, failureText, restoreOnError = false, notice = '', refresh = false }) {
     const before = new Map(requested.map((id) => [id, stateOf(states, id)]));
     setStates((previous) => markState(previous, requested, inFlightState));
     setLoading(busyKey); setStatus(null);
     try {
-      const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: requested }) });
+      // `refresh` is what "Refresh from Apollo" sends: it buys a new copy
+      // instead of being handed the one already stored.
+      const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: requested, refresh }) });
       const data = await readJson(response);
       // Applied as functional updates so an overlapping retry cannot reconcile
       // against a stale snapshot and discard an earlier result.
@@ -666,7 +791,7 @@ export default function App() {
     }
     return runEnrichment({
       path: '/api/candidates/enrich', requested, busyKey: 'enrich', inFlightState: ENRICHING,
-      summarize: enrichmentSummary, failureText: 'Unable to enrich this candidate.'
+      summarize: enrichmentSummary, failureText: 'Unable to enrich this candidate.', refresh
     });
   }
 
@@ -700,7 +825,7 @@ export default function App() {
     // second click would only have repeated what was already on screen.
     return runEnrichment({
       path: '/api/candidates/reveal', requested, busyKey: 'reveal', inFlightState: REVEALING,
-      summarize: revealSummary, failureText: 'Unable to reveal contact details.', restoreOnError: true,
+      summarize: revealSummary, failureText: 'Unable to reveal contact details.', restoreOnError: true, refresh,
       notice: noAddressOnFile
         ? `${noAddressOnFile} selected candidate${noAddressOnFile === 1 ? ' has' : 's have'} no email on file at Apollo and ${noAddressOnFile === 1 ? 'was' : 'were'} left out, so no credit is wasted on ${noAddressOnFile === 1 ? 'it' : 'them'}.`
         : ''
@@ -843,19 +968,46 @@ export default function App() {
       .filter((id) => (enriched.get(id) || known.get(id))?.hasPhoneOnFile !== false);
   }
 
-  const mergedCandidates = candidates.map((candidate) => (candidate.id && enriched.get(candidate.id)) || candidate);
-  const visibleCandidates = mergedCandidates.filter((candidate) => matchesRowQuery(candidate, localRowQuery()));
-  const hiddenByRowQuery = mergedCandidates.length - visibleCandidates.length;
+  const mergedCandidates = shownList();
+  const visibleCandidates = mergedCandidates;
   const totalPages = total !== null && perPage ? Math.max(1, Math.ceil(total / perPage)) : null;
   const searching = loading === 'search';
   // Every enabled term, plus what is still uncommitted in the box. Joined with
   // spaces because that is how Apollo reads them: one pool that matches all of
   // them, not one per term.
-  const locations = splitList(filters.location);
-  const missingRequired = REQUIRED_FILTERS
-    .filter((key) => (key === 'location' ? locations.length === 0 : filters[key].trim() === ''));
-  if (REQUIRED_EITHER.every((key) => filters[key].trim() === '')) missingRequired.push('jobTitle');
-  const canSearch = missingRequired.length === 0;
+  // Cities Apollo actually returned for the pool on screen, most common first,
+  // so the picker offers places that exist in this result rather than a guessed
+  // list. Apollo writes a location as "Hyderabad, Telangana, India" and only
+  // the city is worth filtering on, so the first part is what is offered.
+  const locationCounts = new Map();
+  for (const candidate of mergedCandidates) {
+    const city = (candidate.location || '').split(',')[0].trim();
+    if (city) locationCounts.set(city, (locationCounts.get(city) || 0) + 1);
+  }
+  const chosenLocations = splitList(filters.location).map((value) => value.toLowerCase());
+  const chosenSeniorities = splitList(filters.seniority);
+  // Every city the results hold, plus any already ticked - a city must not
+  // vanish from the list because the search it produced no longer returns it,
+  // or there would be no way to untick it.
+  // Ticked cities lead, so one can always be unticked; then the cities these
+  // results actually named, commonest first; then the standing list. Each city
+  // appears once, however many of those three it came from.
+  const seenCities = new Set();
+  const locationOptions = [
+    ...splitList(filters.location).map((city) => [city, locationCounts.get(city) ?? null]),
+    ...[...locationCounts.entries()].sort((a, b) => b[1] - a[1]),
+    ...LOCATION_SUGGESTIONS.map((city) => [city, null])
+  ].filter(([city]) => {
+    const key = city.toLowerCase();
+    if (seenCities.has(key)) return false;
+    seenCities.add(key);
+    return true;
+  });
+  const locationQuery = draftValue('location').trim().toLowerCase();
+  const visibleLocations = locationOptions.filter(([city]) => !locationQuery
+    || chosenLocations.includes(city.toLowerCase())
+    || city.toLowerCase().includes(locationQuery));
+  const anyFilterSet = Object.values(filters).some((value) => value.trim() !== '');
   // What the two spending buttons would cost right now. Shown on the buttons
   // themselves, so the figure that used to need a confirmation dialog is
   // simply on screen.
@@ -871,8 +1023,8 @@ export default function App() {
   // given, so a search for two roles offers both their skills.
   const roleSkills = [...new Set(splitList(filters.jobTitle)
     .flatMap((role) => SKILLS_BY_ROLE[role.trim().toLowerCase()] || []))];
-  const typedSkill = filters.keywords.split(',').pop().trim().toLowerCase();
-  const chosenSkills = splitList(filters.keywords).map((skill) => skill.toLowerCase());
+  const typedSkill = draftValue('keywords').trim().toLowerCase();
+  const chosenSkills = committedValues('keywords').map((skill) => skill.toLowerCase());
   const skillMatches = (roleSkills.length ? roleSkills : COMMON_SKILLS)
     .filter((skill) => !chosenSkills.includes(skill.toLowerCase()))
     .filter((skill) => !typedSkill || skill.toLowerCase().includes(typedSkill));
@@ -896,273 +1048,350 @@ export default function App() {
   const nameNarrowedBy = activeFilterLabels.filter((label) => label !== 'location')
     .join(', ').replace(/, ([^,]*)$/, ' and $1');
   const skillTotals = lastSkillTotals;
-  const resultsSummary = candidates.length
-    ? (total !== null
-      ? `Showing ${candidates.length} of ${total.toLocaleString()} profiles`
-      // A union of several skill searches has no single total Apollo can give,
-      // so the per-skill counts are shown instead of an invented number.
-      : skillTotals.length > 1
-        ? `${candidates.length} candidates matching any of ${skillTotals.length} skills`
-        : `Showing ${candidates.length} profiles`)
-    : 'Profiles returned by Apollo';
+  const anyFilterApplied = ['jobTitle', 'location', 'keywords', 'seniority']
+    .some((key) => filters[key].trim() !== '');
+  // How big the pool is, stated once. Apollo gives no single total for a union
+  // of several skill searches, so that case says what it can rather than
+  // inventing a number.
+  const poolSize = total !== null
+    ? `${total.toLocaleString()} profile${total === 1 ? '' : 's'}`
+    : skillTotals.length > 1
+      ? `${candidates.length} matching any of ${skillTotals.length} skills`
+      : `${candidates.length} profile${candidates.length === 1 ? '' : 's'}`;
 
-  return <main>
+  return <div className="app">
     <header className="topbar">
-      {/* Swap the logo by replacing public/neutara-logo.svg — no code change. */}
-      <img className="mark" src="/neutara-mark.svg" alt="neutara" width="29" height="40" />
-      <div><p className="eyebrow">Talent intelligence</p><h1>Candidate Search</h1></div>
+      {/* Swap the logo by replacing public/neutara-logo.svg - no code change. */}
+      <img className="mark" src="/neutara-mark.svg" alt="neutara" width="32" height="44" />
+      {/* The product name leads and the tagline sits under it, so the pair reads
+          as one block against the mark rather than two stacked labels. */}
+      <div className="brand"><h1>QuickHire</h1><p className="tagline">The fastest way to find who you need.</p></div>
       <p className="secure"><span className="dot" /> Apollo connected</p>
     </header>
 
-    <form className="panel search-panel" onSubmit={submitSearch}>
-      {/* No heading or blurb: the field labels already carry Required, so the
-          copy was repeating itself. Reset keeps its place. */}
-      <div className="panel-heading heading-bare">
-        <button type="button" className="link-button" onClick={resetFilters}>
-          Reset filters
-        </button>
-      </div>
+    {/* Filters left, results right: the filters are the thing a recruiter keeps
+        adjusting, so they stay on screen instead of scrolling away above the
+        rows they change. */}
+    <div className="workspace">
+      <aside className="sidebar" aria-label="Search filters">
+        <div className="sidebar-head">
+          <h2>Filters</h2>
+          <button type="button" className="link-button" onClick={resetFilters} disabled={!anyFilterSet}>Reset all</button>
+        </div>
 
-      <div className="form-grid">
-          {fields.map(([name, label, placeholder, required]) => <div
-            className="field"
-            key={name}
-            ref={name === 'jobTitle' ? roleFieldRef : name === 'keywords' ? skillFieldRef : undefined}
-          >
-            <label htmlFor={`field-${name}`}>
-              {label}{required && <em className="req" aria-hidden="true">Required</em>}
-            </label>
-            <input
-              id={`field-${name}`}
-              name={name}
-              value={filters[name]}
-              onChange={updateFilter}
-              placeholder={placeholder}
-              required={required}
-              aria-required={required}
-              autoComplete="off"
-              onFocus={name === 'jobTitle' ? () => setRolesOpen(true)
-                : name === 'keywords' ? () => setSkillsOpen(true) : undefined}
-              onKeyDown={(event) => {
-                if (event.key !== 'Escape') return;
-                if (name === 'jobTitle') setRolesOpen(false);
-                if (name === 'keywords') setSkillsOpen(false);
-              }}
-              role={name === 'jobTitle' || name === 'keywords' ? 'combobox' : undefined}
-              aria-expanded={name === 'jobTitle' ? rolesOpen : name === 'keywords' ? skillsOpen : undefined}
-              aria-controls={name === 'jobTitle' ? 'role-suggestions' : name === 'keywords' ? 'skill-suggestions' : undefined}
-            />
-            {MULTI_VALUE_FIELDS.includes(name) && splitList(filters[name]).length > 0
-              && <ul className={`chips chips-editable ${name === 'location' ? 'location-chips' : 'skill-chips'}`}>
-                {splitList(filters[name]).map((value) => <li key={value} className="chip-on">
-                  <span className="chip-static">{value}</span>
-                  <button
-                    type="button"
-                    className="chip-remove"
-                    aria-label={`Remove ${value}`}
-                    onClick={() => removeValue(name, value)}
-                  >&times;</button>
-                </li>)}
-              </ul>}
-            {name === 'keywords' && <>
+        {/* The form element is here so Enter behaves, not as a step the
+            recruiter has to take: there is no submit button to press. */}
+        <form className="filter-form" onSubmit={submitSearch}>
+          <div className="filter-block" ref={roleFieldRef}>
+            <label htmlFor="field-jobTitle">Role / Job Title</label>
+            <div className="control">
+              <input
+                id="field-jobTitle"
+                name="jobTitle"
+                value={filters.jobTitle}
+                onChange={updateFilter}
+                onFocus={() => setRolesOpen(true)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Escape') setRolesOpen(false);
+                  if (event.key === 'Enter') { event.preventDefault(); commitRole(); }
+                }}
+                placeholder="e.g. Data Scientist"
+                autoComplete="off"
+                role="combobox"
+                aria-expanded={rolesOpen}
+                aria-controls="role-suggestions"
+              />
               <button
                 type="button"
-                className="role-toggle"
-                aria-label={skillsOpen ? 'Hide suggested skills' : 'Show suggested skills'}
-                aria-expanded={skillsOpen}
-                onClick={() => setSkillsOpen(!skillsOpen)}
-              >&#9662;</button>
-              {skillsOpen && skillMatches.length > 0 && <ul className="role-list" id="skill-suggestions" role="listbox">
-                {roleSkills.length > 0 && <li className="role-list-note">
-                  Suggested for {splitList(filters.jobTitle).join(' and ')}
-                </li>}
-                {skillMatches.map((skill) => <li key={skill}>
-                  <button
-                    type="button"
-                    role="option"
-                    aria-selected="false"
-                    onMouseDown={(event) => { event.preventDefault(); chooseSkill(skill); }}
-                  >{skill}</button>
-                </li>)}
-              </ul>}
-            </>}
-            {name === 'jobTitle' && <>
-              <button
-                type="button"
-                className="role-toggle"
+                className="control-toggle"
                 aria-label={rolesOpen ? 'Hide suggested roles' : 'Show suggested roles'}
                 aria-expanded={rolesOpen}
                 onClick={() => setRolesOpen(!rolesOpen)}
               >&#9662;</button>
-              {rolesOpen && roleMatches.length > 0 && <ul className="role-list" id="role-suggestions" role="listbox">
-                {roleMatches.map((role) => <li key={role}>
-                  <button
-                    type="button"
-                    role="option"
-                    aria-selected="false"
-                    // Chosen on mousedown: a click would blur the field and
-                    // close the list before the selection landed.
-                    onMouseDown={(event) => { event.preventDefault(); chooseRole(role); }}
-                  >{role}</button>
-                </li>)}
-              </ul>}
-            </>}
-          </div>)}
-          <div className="field">
-            <label htmlFor="field-seniority">Seniority</label>
-            <select id="field-seniority" name="seniority" value={filters.seniority} onChange={updateFilter}>
-              <option value="">Any level</option>
-              {SENIORITIES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-            </select>
+            </div>
+            {rolesOpen && roleMatches.length > 0 && <ul className="picker role-list" id="role-suggestions" role="listbox">
+              {roleMatches.map((role) => <li key={role}>
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected="false"
+                  // Chosen on mousedown: a click would blur the field and close
+                  // the list before the selection landed.
+                  onMouseDown={(event) => { event.preventDefault(); chooseRole(role); }}
+                >{role}</button>
+              </li>)}
+            </ul>}
+          </div>
+
+          {/* Location narrows a search rather than starting one, so the role
+              runs first and this list is how the pool gets cut down. The box
+              does both jobs a short list needs: it filters the list as you
+              type, and Enter adds a city the list does not hold - which is the
+              only way in for one, because Apollo cannot tell us which cities a
+              pool contains and returns no location on a search row at all. */}
+          <div className="filter-block">
+            <span className="block-label" id="location-label">Location</span>
+            <input
+              className="option-search"
+              id="field-location"
+              name="location"
+              value={draftValue('location')}
+              onChange={(event) => setDraft('location', event.target.value)}
+              onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); commitDraft(); } }}
+              placeholder="Search or add a city"
+              aria-label="Search or add a city"
+              autoComplete="off"
+            />
+            <ul className="option-list location-options" role="group" aria-labelledby="location-label">
+              {visibleLocations.map(([city, count]) => <li key={city}>
+                <label className="option">
+                  <input
+                    type="checkbox"
+                    checked={chosenLocations.includes(city.toLowerCase())}
+                    onChange={() => toggleValue('location', city)}
+                  />
+                  <span className="option-name">{city}</span>
+                  {count !== null && <em className="facet-count">{count}</em>}
+                </label>
+              </li>)}
+            </ul>
+            {/* A city nobody listed is not a dead end, so the way to add it is
+                on screen at the moment it is needed. */}
+            {locationQuery && !visibleLocations.some(([city]) => city.toLowerCase() === locationQuery)
+              && <p className="filter-note">Press Enter to add &ldquo;{draftValue('location').trim()}&rdquo;.</p>}
+            {/* Apollo ORs locations, so the honest description of two cities is
+                a wider search rather than a narrower one. */}
+            {chosenLocations.length > 1 && <p className="filter-note">Candidates in any of these cities.</p>}
+          </div>
+
+          <div className="filter-block" ref={skillFieldRef}>
+            <label htmlFor="field-keywords">Skills</label>
+            <div className="control">
+              <input
+                id="field-keywords"
+                name="keywords"
+                value={draftValue('keywords')}
+                onChange={(event) => setDraft('keywords', event.target.value)}
+                onFocus={() => setSkillsOpen(true)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Escape') setSkillsOpen(false);
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    setSkillsOpen(false);
+                    commitDraft();
+                  }
+                }}
+                placeholder="One skill, then Enter"
+                autoComplete="off"
+                role="combobox"
+                aria-expanded={skillsOpen}
+                aria-controls="skill-suggestions"
+              />
+              <button
+                type="button"
+                className="control-toggle"
+                aria-label={skillsOpen ? 'Hide suggested skills' : 'Show suggested skills'}
+                aria-expanded={skillsOpen}
+                onClick={() => setSkillsOpen(!skillsOpen)}
+              >&#9662;</button>
+            </div>
+            {committedValues('keywords').length > 0 && <ul className="chips chips-editable skill-chips">
+              {committedValues('keywords').map((value) => <li key={value} className="chip-on">
+                <span className="chip-static">{value}</span>
+                <button type="button" className="chip-remove" aria-label={`Remove ${value}`} onClick={() => removeValue('keywords', value)}>&times;</button>
+              </li>)}
+            </ul>}
+            {skillsOpen && skillMatches.length > 0 && <ul className="picker" id="skill-suggestions" role="listbox">
+              {roleSkills.length > 0 && <li className="picker-note">
+                Suggested for {splitList(filters.jobTitle).join(' and ')}
+              </li>}
+              {skillMatches.map((skill) => <li key={skill}>
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected="false"
+                  onMouseDown={(event) => { event.preventDefault(); chooseSkill(skill, event); }}
+                >{skill}</button>
+              </li>)}
+            </ul>}
+            {/* Apollo can require every keyword at once, which routinely empties
+                a pool, so one match is the default and the strict version is a
+                deliberate tick rather than where a recruiter lands. */}
+            {committedValues('keywords').length > 1 && <label className="filter-toggle skills-mode">
+              <input
+                type="checkbox"
+                checked={matchAllSkills}
+                onChange={toggleMatchAllSkills}
+              />
+              Must have every skill
+            </label>}
+          </div>
+
+          {/* Levels are an OR at Apollo, and a hire is routinely open to two of
+              them, so this is a list of ticks rather than one choice. */}
+          <div className="filter-block">
+            <span className="block-label" id="seniority-label">Seniority</span>
+            <ul className="option-list seniority-options" role="group" aria-labelledby="seniority-label">
+              {SENIORITIES.map(([value, label]) => <li key={value}>
+                <label className="option">
+                  <input
+                    type="checkbox"
+                    name="seniority"
+                    value={value}
+                    checked={chosenSeniorities.includes(value)}
+                    onChange={() => toggleValue('seniority', value)}
+                  />
+                  <span className="option-name">{label}</span>
+                </label>
+              </li>)}
+            </ul>
+          </div>
+        </form>
+
+      </aside>
+
+      <section className="results-pane results">
+        <div className="results-head">
+          <h3>Candidates</h3>
+          <div className="selection-actions">
+            <span>Selected: <b>{selected.size}</b></span>
+            <button type="button" onClick={clearSelection} disabled={!selected.size}>Clear</button>
+            <button type="button" className="reveal" onClick={() => reveal()} disabled={!selected.size || Boolean(loading)}>
+              {loading === 'reveal'
+                ? 'Revealing email...'
+                : `Reveal email${emailCost ? ` - ${emailCost} credit${emailCost === 1 ? '' : 's'}` : ''}`}
+            </button>
+            <button type="button" className="reveal" onClick={() => revealPhones()} disabled={!selected.size || Boolean(loading)}>
+              {loading === 'phone'
+                ? 'Revealing phone...'
+                : `Reveal phone${phoneIds.length ? ` - ${phoneIds.length} mobile credit${phoneIds.length === 1 ? '' : 's'}` : ''}`}
+            </button>
+            <button type="button" className="secondary" onClick={() => enrich()} disabled={!selected.size || Boolean(loading)}>
+              {loading === 'enrich' ? 'Enriching selected candidates...' : `Enrich selected${selected.size ? ` (${selected.size})` : ''}`} <span>&#8599;</span>
+            </button>
           </div>
         </div>
-        {/* Apollo requires every keyword to match, so each term is held
-            separately and can be turned off without retyping the others. */}
-        {splitList(filters.keywords).length > 1 && <label className="filter-toggle skills-mode">
-          <input
-            type="checkbox"
-            checked={matchAllSkills}
-            onChange={() => setMatchAllSkills(!matchAllSkills)}
-          />
-          Candidate must have every skill, not just one
-        </label>}
 
-        {/* What each query actually returned. Nothing here sends a request; it
-            is the record of searches already run. */}
-        {refineTrail.length > 1 && <div className="refine-trail">
-          <span className="trail-label">Pool size as you narrowed</span>
-          <ol>
-            {refineTrail.map((entry, index) => <li key={`${entry.keywords}-${index}`} className={entry.total ? '' : 'is-empty'}>
-              <b>{entry.total.toLocaleString()}</b> <span>{entry.keywords || 'no skills'}</span>{' '}
-              {entry.seniority && <em>{entry.seniority}</em>}
-            </li>)}
-          </ol>
+        {matchedAll && <p className="hint spend-note">
+          Every skill was required at once, so each of these candidates has all of{' '}
+          <b>{skillTotals[0]?.skill}</b>. Untick the box beside Skills to see candidates who
+          have any one of them instead.
+        </p>}
+
+        {!matchedAll && skillTotals.length > 1 && <p className="hint spend-note">
+          Each skill was searched separately and the answers merged, so a candidate
+          needs only one of them. Apollo held{' '}
+          {skillTotals.map((entry, index) => <span key={entry.skill}>
+            {index > 0 ? ', ' : ''}<b>{(entry.total || 0).toLocaleString()}</b> for {entry.skill}
+          </span>)}.
+        </p>}
+
+        {/* The one thing a price cannot say: whether Apollo has actually
+            committed to holding a number for these people. */}
+        {phoneIds.length > 0 && <p className="hint spend-note">
+          {phoneConfirmed
+            ? `Apollo confirms a direct number for ${phoneConfirmed} of the ${phoneIds.length} selected. Mobile credits cost more than an email.`
+            : `Apollo has not confirmed it holds a number for ${phoneIds.length === 1 ? 'the selected candidate' : 'any of the selected candidates'} - revealing may return nothing. Mobile credits cost more than an email.`}
+        </p>}
+
+        {(candidates.length > 0 || filters.personName) && <div className="row-search">
+          <p className="pool-size">{poolSize}</p>
+          <div className="name-search">
+            <label className="visually-hidden" htmlFor="row-search">Find a candidate</label>
+            <input
+              id="row-search"
+              type="search"
+              value={rowQuery}
+              onChange={(event) => setRowQuery(event.target.value)}
+              onFocus={() => setNameFocused(true)}
+              onBlur={() => setNameFocused(false)}
+              // Enter searches the whole pool by name, because that is what
+              // pressing Enter in a search box is expected to do. The button
+              // beside it does the same thing for anyone who reaches for one.
+              onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); searchWholePoolByName(); } }}
+              placeholder={searching && rowQuery.trim() === filters.personName
+                ? 'Searching Apollo...'
+                : 'Search by candidate name'}
+            />
+            {/* Both live inside the box. mousedown is prevented so the field
+                does not blur out from under the button being clicked. */}
+            {(rowQuery !== '' || filters.personName) && <button
+              type="button"
+              className="box-button box-clear"
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={clearNameBox}
+              disabled={searching}
+              aria-label={filters.personName ? 'Clear the name filter' : 'Clear the box'}
+            >&times;</button>}
+            {(nameFocused || rowQuery !== '') && <button
+              type="button"
+              className="box-button search-go"
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={searchWholePoolByName}
+              disabled={searching || !rowQuery.trim() || rowQuery.trim() === filters.personName}
+              aria-label="Search Apollo for this name"
+            >
+              <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true" focusable="false">
+                <circle cx="9" cy="9" r="6" fill="none" stroke="currentColor" strokeWidth="2" />
+                <path d="M13.5 13.5 L17.5 17.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+              </svg>
+            </button>}
+          </div>
+
+          {filters.personName && <p className="hint">
+            <strong>Named "{filters.personName}"</strong>
+            {nameNarrowedBy ? `, matching your ${nameNarrowedBy}` : ' , anywhere in Apollo'}
+            {total !== null ? ` - ${total.toLocaleString()} profile${total === 1 ? '' : 's'}.` : '.'}
+            {filters.location.trim() ? ' Location is not applied to a name search.' : ''}
+          </p>}
+
+          {/* Typing spends nothing, so the box says what pressing Enter will
+              actually ask for rather than pretending it has already asked. */}
+          {rowQuery.trim() !== '' && rowQuery.trim() !== filters.personName && <p className="hint">
+            {nameNarrowedBy
+              ? `Press Enter to search every ${nameNarrowedBy} in the pool for "${rowQuery.trim()}".`
+              : `Press Enter to search the whole pool for "${rowQuery.trim()}".`}
+          </p>}
         </div>}
 
-        <div className="search-actions">
-          <button type="submit" className="primary" disabled={searching || !canSearch}>
-            {searching ? 'Searching...' : 'Search Candidates'} <span>→</span>
-          </button>
-          {!canSearch && <p className="hint">A location is required, along with a role or at least one skill.</p>}
-        </div>
-    </form>
+        {status && <div className={`notice ${status.type}`} role="status" aria-live="polite">{status.text}</div>}
 
-    {(status || searching || candidates.length > 0) && <section className="results">
-      <div className="results-head">
-        <div><span className="step">02</span><div><h3>Candidate results</h3><p>{resultsSummary}</p></div></div>
-        <div className="selection-actions">
-          <span>Selected: <b>{selected.size}</b></span>
-          <button type="button" onClick={selectAll} disabled={!candidates.length}>Select all</button>
-          <button type="button" onClick={clearSelection} disabled={!selected.size}>Clear</button>
-          <button type="button" className="reveal" onClick={() => reveal()} disabled={!selected.size || Boolean(loading)}>
-            {loading === 'reveal'
-              ? 'Revealing email...'
-              : `Reveal email${emailCost ? ` - ${emailCost} credit${emailCost === 1 ? '' : 's'}` : ''}`}
-          </button>
-          <button type="button" className="reveal" onClick={() => revealPhones()} disabled={!selected.size || Boolean(loading)}>
-            {loading === 'phone'
-              ? 'Revealing phone...'
-              : `Reveal phone${phoneIds.length ? ` - ${phoneIds.length} mobile credit${phoneIds.length === 1 ? '' : 's'}` : ''}`}
-          </button>
-          <button type="button" className="secondary" onClick={() => enrich()} disabled={!selected.size || Boolean(loading)}>
-            {loading === 'enrich' ? 'Enriching selected candidates...' : `Enrich selected${selected.size ? ` (${selected.size})` : ''}`} <span>↗</span>
-          </button>
-        </div>
-      </div>
+        {searching && !candidates.length && <SkeletonRows />}
 
-      {matchedAll && <p className="hint spend-note">
-        Every skill was required at once, so each of these candidates has all of{' '}
-        <b>{skillTotals[0]?.skill}</b>. Untick the box above to see candidates who
-        have any one of them instead.
-      </p>}
+        {!searching && !candidates.length && !status && <div className="empty-state">
+          <p className="empty-title">No candidates on screen</p>
+          <p>Loosen a filter on the left, or drop one, to widen the pool again.</p>
+        </div>}
 
-      {!matchedAll && skillTotals.length > 1 && <p className="hint spend-note">
-        Each skill was searched separately and the answers merged, so a candidate
-        needs only one of them. Apollo held{' '}
-        {skillTotals.map((entry, index) => <span key={entry.skill}>
-          {index > 0 ? ', ' : ''}<b>{(entry.total || 0).toLocaleString()}</b> for {entry.skill}
-        </span>)}.
-      </p>}
+        {candidates.length > 0 && visibleCandidates.length > 0 && <div className="table">
+          <div className="table-head"><span /><span>Candidate</span><span>Company</span><span>Contact</span><span /></div>
+          {visibleCandidates.map((candidate, index) => {
+            const id = candidate.requestedId || candidate.id;
+            return <CandidateBlock
+              key={id || `row-${index}`}
+              candidate={candidate}
+              selected={Boolean(id) && selected.has(id)}
+              selectable={Boolean(id)}
+              state={stateOf(states, id)}
+              expanded={expanded.has(id)}
+              busy={Boolean(loading)}
+              onToggle={() => toggle(id)}
+              onExpand={() => toggleExpanded(id)}
+              onRetry={() => enrich([id], { refresh: true })}
+              onRefresh={() => enrich([id], { refresh: true })}
+              onReveal={() => reveal([id])}
+            />;
+          })}
+        </div>}
 
-      {/* The one thing a price cannot say: whether Apollo has actually
-          committed to holding a number for these people. */}
-      {phoneIds.length > 0 && <p className="hint spend-note">
-        {phoneConfirmed
-          ? `Apollo confirms a direct number for ${phoneConfirmed} of the ${phoneIds.length} selected. Mobile credits cost more than an email.`
-          : `Apollo has not confirmed it holds a number for ${phoneIds.length === 1 ? 'the selected candidate' : 'any of the selected candidates'} - revealing may return nothing. Mobile credits cost more than an email.`}
-      </p>}
-
-      {(candidates.length > 0 || filters.personName) && <div className="row-search">
-        <label>
-          Find a candidate
-          <input
-            type="search"
-            value={rowQuery}
-            onChange={(event) => setRowQuery(event.target.value)}
-            // Enter runs the same whole-pool search as the button, because that
-            // is what pressing Enter in a search box is expected to do.
-            onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); searchWholePoolByName(); } }}
-            placeholder={searching && rowQuery.trim() === filters.personName
-              ? 'Searching Apollo...'
-              : 'Candidate name - press Enter to search all of Apollo'}
-          />
-          {filters.personName && <button type="button" className="link-button" onClick={clearNameFilter} disabled={searching}>
-            Clear name
-          </button>}
-        </label>
-
-        {filters.personName && <p className="hint">
-          <strong>Named "{filters.personName}"</strong>
-          {nameNarrowedBy ? `, matching your ${nameNarrowedBy}` : ' , anywhere in Apollo'}
-          {total !== null ? ` - ${total.toLocaleString()} profile${total === 1 ? '' : 's'}.` : '.'}
-          {filters.location.trim() ? ' Location is not applied to a name search.' : ''}
-        </p>}
-
-        {rowQuery.trim() !== '' && rowQuery.trim() !== filters.personName && <p className="hint">
-          {visibleCandidates.length
-            ? `${visibleCandidates.length} of ${mergedCandidates.length} name${mergedCandidates.length === 1 ? '' : 's'} on this page match.`
-            : `No name on this page matches "${rowQuery.trim()}".`}
-          {' '}{nameNarrowedBy
-            ? `Press Enter to search all of Apollo for that name, narrowed by your ${nameNarrowedBy}.`
-            : 'Press Enter to search all of Apollo for that name.'}
-          {hiddenByRowQuery > 0 ? ' Hidden rows are never selected by Select all.' : ''}
-        </p>}
-      </div>}
-
-      {status && <div className={`notice ${status.type}`} role="status" aria-live="polite">{status.text}</div>}
-
-      {searching && !candidates.length && <SkeletonRows />}
-
-      {candidates.length > 0 && visibleCandidates.length > 0 && <div className="table">
-        <div className="table-head"><span /><span>Candidate</span><span>Company</span><span>Location</span><span>Contact</span><span>Enriched</span></div>
-        {visibleCandidates.map((candidate, index) => {
-          const id = candidate.requestedId || candidate.id;
-          return <CandidateBlock
-            key={id || `row-${index}`}
-            candidate={candidate}
-            selected={Boolean(id) && selected.has(id)}
-            selectable={Boolean(id)}
-            state={stateOf(states, id)}
-            expanded={expanded.has(id)}
-            busy={Boolean(loading)}
-            onToggle={() => toggle(id)}
-            onExpand={() => toggleExpanded(id)}
-            onRetry={() => enrich([id], { refresh: true })}
-            onRefresh={() => enrich([id], { refresh: true })}
-            onReveal={() => reveal([id])}
-          />;
-        })}
-      </div>}
-
-      {candidates.length > 0 && <div className="pagination">
-        <button type="button" onClick={() => search(page - 1)} disabled={page <= 1 || searching}>← Previous</button>
-        <span>Page <b>{page}</b>{totalPages ? ` of ${totalPages.toLocaleString()}` : ''}</span>
-        <button type="button" onClick={() => search(page + 1)} disabled={searching || (totalPages ? page >= totalPages : candidates.length === 0)}>Next →</button>
-      </div>}
-    </section>}
-
-    <footer>Results and profile links are supplied by Apollo. LinkedIn profiles are never visited or scraped by this application.</footer>
-  </main>;
+        {candidates.length > 0 && <div className="pagination">
+          <button type="button" onClick={() => search(page - 1)} disabled={page <= 1 || searching}>&#8592; Previous</button>
+          <span>Page <b>{page}</b>{totalPages ? ` of ${totalPages.toLocaleString()}` : ''}</span>
+          <button type="button" onClick={() => search(page + 1)} disabled={searching || (totalPages ? page >= totalPages : candidates.length === 0)}>Next &#8594;</button>
+        </div>}
+      </section>
+    </div>
+  </div>;
 }
 
 export { NOT_ENRICHED, ENRICHING, ENRICHED, FAILED };

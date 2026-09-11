@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { enrichPeople, matchPerson, normalizeWaterfallCandidate, pollWaterfallResult, requestPhoneNumbers, requestWaterfallEmails, searchPeople, splitList } from './apolloService.js';
+import { NEEDS_ENRICHED, NEEDS_PHONE, NEEDS_REVEALED, readCached, saveCandidates } from './store.js';
 
 // Credit guard: the most people one /enrich call will forward to Apollo.
 // Anything beyond this is reported back as skipped, never silently dropped.
@@ -52,12 +53,12 @@ function rememberWaterfall(requestId, kind) {
 
 // Mirrors the client. Kept here so the API cannot be driven past the rule.
 //
-// Location, plus at least one of role or skills. Skills used to be required
-// alongside the role, which made the most destructive filter compulsory:
-// measured against the live API, one keyword cut a 3,088-candidate pool to 9,
-// and a role on its own is a perfectly meaningful search.
-const REQUIRED_FILTERS = ['location'];
-const REQUIRED_EITHER = ['jobTitle', 'keywords'];
+// Nothing is required of a search any more. Every filter here narrows a pool
+// rather than creating one, and each requirement in turn - skills, then
+// location, then a role - turned out to be a way of refusing to answer a
+// question Apollo answers perfectly well. Measured against the live API, one
+// keyword cut a 3,088-candidate pool to 9, so demanding one was the most
+// destructive default of the three.
 
 const app = express();
 
@@ -86,9 +87,13 @@ app.post('/api/apollo/waterfall-webhook', express.text({ type: '*/*', limit: '1m
   // Read with the waterfall normalizer: a delivered payload carries the
   // vendors' findings in `emails`/`phone_numbers`/`waterfall`, not in the
   // enrichment fields, so the ordinary normalizer saw nothing in it.
-  waterfallResults.set(requestId, people
+  const delivered = people
     .filter((person) => person && (person.id || person.person_id))
-    .map((person) => normalizeWaterfallCandidate(person, { requestedId: person.id || person.person_id, kind })));
+    .map((person) => normalizeWaterfallCandidate(person, { requestedId: person.id || person.person_id, kind }));
+  waterfallResults.set(requestId, delivered);
+  // Apollo charged for these whether or not anybody looks at them twice, so
+  // they are kept against the next time this candidate comes up.
+  saveCandidates(delivered, kind === 'phone' ? { phone: true } : { revealed: true });
   response.json({ received: true });
 });
 
@@ -118,10 +123,10 @@ function publicError(error) {
 
 app.post('/api/candidates/search', async (request, response) => {
   const filters = Object.fromEntries(['jobTitle', 'location', 'seniority', 'keywords', 'company', 'industry', 'personName']
-    // Role, skills and location are comma-separated lists, so they need more
-    // room than a single value; the rest keep the original bound.
+    // Role, skills, location and seniority are comma-separated lists, so they
+    // need more room than a single value; the rest keep the original bound.
     .map((key) => [key, clean(request.body?.[key],
-      ['jobTitle', 'keywords', 'location'].includes(key) ? 400 : 160)]));
+      ['jobTitle', 'keywords', 'location', 'seniority'].includes(key) ? 400 : 160)]));
   const page = Math.max(1, Math.min(1000, Number.parseInt(request.body?.page, 10) || 1));
   // Costs nothing and keeps credits off candidates Apollo holds no address for.
   // Defaults on: the caller must opt out deliberately.
@@ -137,22 +142,30 @@ app.post('/api/candidates/search', async (request, response) => {
   // A name is exempt: looking a person up by name is a meaningful search in its
   // own right, and demanding a role and a location alongside it is what made a
   // name search return nothing. Apollo's q_person_name works on its own.
-  // Counted as a list, not as text: " , , " is punctuation, not a location, and
-  // it used to satisfy the requirement while sending Apollo nothing.
-  const missing = filters.personName
-    ? []
-    : REQUIRED_FILTERS.filter((key) => (key === 'location' ? splitList(filters[key]).length === 0 : filters[key] === ''));
-  // A location on its own describes a city, not a search.
-  if (!filters.personName && REQUIRED_EITHER.every((key) => filters[key] === '')) missing.push(...REQUIRED_EITHER);
-  if (missing.length) {
-    return response.status(400).json({
-      error: 'Location is required, along with a role or at least one skill.',
-      missing
-    });
-  }
+  // No filter is required. A search with none of them is the whole pool, which
+  // is what the app opens on so a recruiter can see who is there before
+  // describing who they want. Punctuation is still not a filter - " , , " in
+  // the skills field reaches Apollo as no keywords rather than as a term that
+  // matches nothing.
   try {
     const result = await searchPeople(filters, page, 25, { verifiedEmailOnly, matchAllSkills });
-    response.json(result);
+    // A candidate this account has already paid to enrich comes back enriched:
+    // the details are ours to show from here on, so the row offers them
+    // straight away instead of asking for a credit that was already spent.
+    const ids = result.candidates.map((candidate) => candidate.id).filter(Boolean);
+    const known = readCached(ids, NEEDS_ENRICHED);
+    response.json({
+      ...result,
+      candidates: result.candidates.map((candidate) => {
+        const held = candidate.id && known.get(candidate.id);
+        // The search row is the newer statement of where somebody works, so it
+        // wins on the fields it actually carries; the stored record supplies
+        // everything a search never returns.
+        return held
+          ? { ...held, ...Object.fromEntries(Object.entries(candidate).filter(([, value]) => value !== null && value !== undefined && value !== '')), enriched: true, fromCache: true }
+          : candidate;
+      })
+    });
   } catch (error) {
     const [message, status, code] = publicError(error);
     response.status(status).json({ error: message, code });
@@ -198,11 +211,30 @@ async function enrichRoute(request, response, { revealPersonalEmails, max }) {
   const ids = requested.slice(0, max);
   const skippedIds = requested.slice(max);
   if (!ids.length) return response.status(400).json({ error: 'Select at least one candidate to enrich.' });
+  // "Refresh from Apollo" is the way past the stored copy: a recruiter who
+  // thinks a record has gone stale must be able to buy a fresh one.
+  const refresh = request.body?.refresh === true;
+  // A stored enrichment cannot answer a reveal - it never held a personal
+  // address - so each request is served only from the credit that paid for it.
+  const need = revealPersonalEmails ? NEEDS_REVEALED : NEEDS_ENRICHED;
+  const held = refresh ? new Map() : readCached(ids, need);
+  const toAsk = ids.filter((id) => !held.has(id));
   try {
-    const { candidates, failedIds } = await enrichPeople(ids, { revealPersonalEmails });
+    const { candidates, failedIds } = toAsk.length
+      ? await enrichPeople(toAsk, { revealPersonalEmails })
+      : { candidates: [], failedIds: [] };
+    saveCandidates(candidates, { enriched: true, revealed: revealPersonalEmails === true });
     // requestedIds lets the client resolve every selected ID to an outcome:
-    // enriched, failed, or skipped by the per-request cap.
-    response.json({ requestedIds: ids, candidates, failedIds, skippedIds, revealedPersonalEmails: revealPersonalEmails === true });
+    // enriched, failed, skipped by the per-request cap - or served from the
+    // record this account already owns, which cost nothing.
+    response.json({
+      requestedIds: ids,
+      candidates: [...held.values(), ...candidates],
+      failedIds,
+      skippedIds,
+      fromCacheIds: [...held.keys()],
+      revealedPersonalEmails: revealPersonalEmails === true
+    });
   } catch (error) {
     const [message, status, code] = publicError(error);
     response.status(status).json({ error: message, code });
@@ -297,9 +329,21 @@ app.post('/api/candidates/phone', async (request, response) => {
   const requested = Array.isArray(request.body?.ids)
     ? [...new Set(request.body.ids.filter((id) => typeof id === 'string' && id.trim() !== '').map((id) => id.slice(0, 120)))]
     : [];
-  const ids = requested.slice(0, MAX_PHONE_PER_REQUEST);
+  const askedFor = requested.slice(0, MAX_PHONE_PER_REQUEST);
   const skippedIds = requested.slice(MAX_PHONE_PER_REQUEST);
-  if (!ids.length) return response.status(400).json({ error: 'Select at least one candidate to reveal a phone number for.' });
+  if (!askedFor.length) return response.status(400).json({ error: 'Select at least one candidate to reveal a phone number for.' });
+
+  // A number this account already bought is handed straight back. Mobile
+  // credits are the dearest thing this app spends, so this is the one worth
+  // getting right.
+  const held = request.body?.refresh === true ? new Map() : readCached(askedFor, NEEDS_PHONE);
+  const ids = askedFor.filter((id) => !held.has(id));
+  if (!ids.length) {
+    return response.json({
+      requestedIds: askedFor, requests: [], candidates: [...held.values()],
+      failedIds: [], skippedIds, fromCacheIds: [...held.keys()]
+    });
+  }
 
   // Checked before Apollo is called: Apollo delivers the numbers by POST and
   // charges for them either way, so an unreachable webhook would cost mobile
@@ -315,7 +359,17 @@ app.post('/api/candidates/phone', async (request, response) => {
   try {
     const { requests, candidates, failedIds } = await requestPhoneNumbers(ids, WATERFALL_WEBHOOK_URL);
     for (const job of requests) rememberWaterfall(job.requestId, 'phone');
-    response.json({ requestedIds: ids, requests, candidates, failedIds, skippedIds });
+    // A number that came back on the spot is kept; the ones that arrive later
+    // are kept when the webhook or the poll delivers them.
+    saveCandidates(candidates.filter((candidate) => candidate.phone), { phone: true });
+    response.json({
+      requestedIds: askedFor,
+      requests,
+      candidates: [...held.values(), ...candidates],
+      failedIds,
+      skippedIds,
+      fromCacheIds: [...held.keys()]
+    });
   } catch (error) {
     const [message, status, code] = publicError(error);
     response.status(status).json({ error: message, code });

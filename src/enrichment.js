@@ -13,7 +13,9 @@ const LABELS = {
   [REVEALING]: 'Revealing contact details...',
   [SEARCHING_SOURCES]: 'Searching other sources...',
   [REVEALING_PHONE]: 'Revealing phone number...',
-  [ENRICHED]: 'Yes',
+  // "Yes" answered a column headed "Enriched". The badge stands under the
+  // candidate's name now, where it has to say what it means on its own.
+  [ENRICHED]: 'Enriched',
   [FAILED]: 'Enrichment failed'
 };
 

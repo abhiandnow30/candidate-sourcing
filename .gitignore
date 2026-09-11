@@ -3,3 +3,7 @@ dist/
 .env
 .env.*
 !.env.example
+
+# The local record of what Apollo has already been paid for. Machine-local,
+# and it holds candidate contact data, so it is never committed.
+server/data/
