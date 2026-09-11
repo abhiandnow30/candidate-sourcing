@@ -43,7 +43,8 @@ Enrichment state is tracked per Apollo Person ID for the session. An already-enr
 ## API
 
 - `POST /api/candidates/search` accepts `jobTitle`, `location`, `seniority`, `keywords`, `company`, `industry`, and `page`. It returns `{ candidates, page, perPage, total }`. `jobTitle`, `location` and `keywords` are **required**; `company`, `industry` and `seniority` only narrow an already valid query. Apollo bills for every search, so a request missing any required filter answers `400` with `{ error, missing }` and never calls Apollo. The Search button stays disabled, listing what is still needed, until all three are filled in.
-- `POST /api/candidates/enrich` accepts an explicit `ids` array and returns `{ requestedIds, candidates, failedIds, skippedIds }`.
+- `POST /api/candidates/enrich` accepts an explicit `ids` array and returns `{ requestedIds, candidates, failedIds, skippedIds }`. It sends `reveal_personal_emails: false`, so it never spends Apollo's contact credits.
+- `POST /api/candidates/reveal` takes the same body and answers in the same shape plus `revealedPersonalEmails: true`. It is the only route that sends `reveal_personal_emails: true`, and it is reached only from the recruiter's explicit **Reveal contact details** action - never from search and never from plain enrichment. Both routes share the 25-per-request cap and the batching of 10, and both keep `reveal_phone_number: false`; phone reveal is asynchronous and lands separately.
 
 `requestedIds`, `failedIds`, and `skippedIds` together account for every ID the client sent, so no selected candidate is silently dropped. `skippedIds` holds anything beyond `MAX_ENRICH_PER_REQUEST` (25), which the recruiter can enrich in a second pass.
 
@@ -83,7 +84,7 @@ LinkedIn URLs are displayed only when Apollo returns them, as a normal external 
 
 ## Security and limitations
 
-`APOLLO_API_KEY` is read only by `server/apolloService.js`, is excluded from Git by `.gitignore`, and is never included in frontend code, browser storage, or API responses. `server/index.test.js` asserts this against both the API responses and the shipped frontend sources. Contact fields remain Apollo-controlled and are not reconstructed when masked or missing: the `email_not_unlocked@` sentinel is discarded rather than shown as an address, and `email_status: "unavailable"` reads as unavailable.
+`APOLLO_API_KEY` is read only by `server/apolloService.js`, is excluded from Git by `.gitignore`, and is never included in frontend code, browser storage, or API responses. `server/index.test.js` asserts this against both the API responses and the shipped frontend sources. Contact fields remain Apollo-controlled and are not reconstructed when masked or missing: the `email_not_unlocked@` sentinel is discarded rather than shown as an address, and `email_status: "unavailable"` reads as unavailable. An address is taken from whichever shape Apollo returned it in — `email`, `personal_emails`, or `contact_emails` — with the masked and unavailable rules applied to every one of them, so a real address is never dropped and a withheld one is never shown.
 
 The `/api` endpoints spend Apollo credits and are same-origin only by default, sending no CORS headers. Set `ALLOWED_ORIGIN` (comma separated) only when the frontend is genuinely deployed on a different origin. There is no authentication or server-side rate limiting yet, so do not expose these endpoints beyond localhost without adding both.
 

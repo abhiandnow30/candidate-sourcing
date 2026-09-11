@@ -44,6 +44,7 @@ h1 { font-size: 17px; }
 .panel-heading > div:first-child, .results-head > div:first-child { display: flex; gap: 23px; }
 .step { color: #a3aa9e; padding-top: 4px; }
 h3 { font-size: 17px; margin-bottom: 5px; }
+.heading-bare { justify-content: flex-end; margin-bottom: 12px; }
 .panel-heading p, .results-head p { color: var(--muted); font-size: 12px; }
 .hint { margin-top: 12px; color: var(--muted); font-size: 11px; }
 .req { display: inline-block; margin-left: 7px; color: #9a6b3c; font-style: normal; font-size: 8px; letter-spacing: .08em; }
@@ -63,6 +64,23 @@ input:focus, select:focus { border-color: var(--green); }
 .selection-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 .selection-actions > span { margin-right: 5px; color: var(--muted); font-size: 12px; }
 .selection-actions button, .pagination button { border: 0; background: none; color: var(--green); font-size: 11px; padding: 6px 0; }
+/* Reveal spends extra Apollo credits, so it reads as a deliberate second
+   action: outlined rather than filled, never mistaken for Enrich. */
+/* The spend confirmation. Deliberately not styled as an error: it is a normal
+   step, but one the recruiter must read before money leaves the account. */
+.notice.confirm { border: 1px solid var(--green); background: #f4f8f2; }
+.notice.confirm p { margin: 0 0 12px; }
+.confirm-actions { display: flex; align-items: center; gap: 16px; }
+.reveal { border: 1px solid var(--green) !important; color: var(--green) !important; padding: 11px 14px !important; font-weight: 700; font-size: 12px !important; }
+.reveal:disabled { opacity: .45; }
+.enriched-actions { display: flex; align-items: center; gap: 16px; }
+.search-scope { margin-bottom: 14px; }
+.filter-toggle { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; cursor: pointer; }
+/* The global `input { width: 100% }` above is meant for the text fields. Left
+   unchecked it stretches these checkboxes across the row and pushes their label
+   to the far edge, so they are pinned back to their natural size here. */
+.filter-toggle input[type="checkbox"] { display: inline-block; flex: none; width: 14px; height: 14px; padding: 0; margin: 0; }
+.filter-toggle input { accent-color: var(--green); }
 .secondary { background: var(--ink) !important; color: white !important; padding: 12px 15px !important; font-weight: 700; font-size: 12px !important; margin-left: 4px; }
 
 /* Six columns fit a 1366px laptop with no sideways scroll. */
@@ -150,3 +168,42 @@ footer { border-top: 1px solid var(--line); margin-top: 44px; padding-top: 18px;
   .enriched-details { padding: 18px 16px 20px; }
   .skeleton-row { grid-template-columns: 1fr; gap: 8px; }
 }
+
+/* Two ways into the search: filter a pool, or match one known person. A
+   radiogroup rather than a checkbox, because the modes are exclusive. */
+.mode-switch { display: inline-flex; border: 1px solid var(--line); background: white; margin-bottom: 22px; }
+.mode-option { border: 0; background: none; padding: 9px 15px; color: var(--muted); font-family: 'DM Mono', monospace; text-transform: uppercase; letter-spacing: .07em; font-size: 10px; }
+.mode-option + .mode-option { border-left: 1px solid var(--line); }
+.mode-option.is-on { background: var(--ink); color: white; }
+.mode-option:focus-visible { outline: 2px solid var(--green); outline-offset: -2px; }
+
+/* Skills are separate terms because Apollo ANDs every keyword: three skills
+   routinely narrow a pool to nothing, so each one must be droppable. */
+.skill-terms { margin: 18px 0 4px; }
+.skill-terms-label { display: block; font-family: 'DM Mono', monospace; text-transform: uppercase; letter-spacing: .07em; font-size: 10px; color: var(--muted); margin-bottom: 8px; }
+.chips-editable { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; padding: 0; margin: 0; }
+.chips-editable li { display: inline-flex; align-items: stretch; border: 1px solid var(--line); background: white; }
+.chips-editable .chip-toggle, .chips-editable .chip-remove { border: 0; background: none; font-size: 11px; color: var(--ink); padding: 5px 9px; }
+.chips-editable .chip-remove { border-left: 1px solid var(--line); color: var(--muted); padding: 5px 8px; }
+.chips-editable .chip-on { border-color: #bcd7ac; background: #e4f0dc; }
+.chips-editable .chip-on .chip-toggle { color: #3c6b32; font-weight: 700; }
+.chips-editable .chip-off .chip-toggle { color: #a4aaa0; text-decoration: line-through; }
+.chips-editable button:focus-visible { outline: 2px solid var(--green); outline-offset: -2px; }
+
+/* The record of searches already run, so the effect of adding a skill is
+   visible rather than remembered. Nothing here sends a request. */
+.refine-trail { margin: 16px 0 4px; }
+.refine-trail ol { display: flex; flex-wrap: wrap; gap: 6px 14px; list-style: none; padding: 0; margin: 0; }
+.refine-trail li { font-size: 11px; color: var(--muted); }
+.refine-trail li b { color: var(--ink); font-size: 12px; }
+.refine-trail li.is-empty b { color: #9a493c; }
+
+/* Narrows the rows already loaded. Local only: it sends nothing to Apollo. */
+.row-search { margin: 4px 0 16px; }
+.row-search label { display: flex; align-items: center; gap: 12px; }
+.row-search input { flex: 1; max-width: 420px; border: 1px solid var(--line); background: white; padding: 8px 10px; font-size: 12px; font-family: inherit; }
+.row-search input:focus-visible { outline: 2px solid var(--green); outline-offset: -1px; }
+.row-search .hint { margin-top: 8px; }
+.row-search-actions { display: flex; align-items: center; gap: 16px; margin-top: 10px; }
+.row-search .hint strong { color: var(--ink); }
+.name-scope { margin-top: 12px; }

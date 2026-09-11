@@ -1,11 +1,54 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { enrichPeople, searchPeople } from './apolloService.js';
+import { enrichPeople, matchPerson, normalizeWaterfallCandidate, pollWaterfallResult, requestPhoneNumbers, requestWaterfallEmails, searchPeople } from './apolloService.js';
 
 // Credit guard: the most people one /enrich call will forward to Apollo.
 // Anything beyond this is reported back as skipped, never silently dropped.
 const MAX_ENRICH_PER_REQUEST = 25;
+
+// A reveal spends a credit per candidate, so it is capped tighter than plain
+// enrichment. One mis-click on a large selection should not be able to drain an
+// account; the remainder comes back as skippedIds for a deliberate second pass.
+export const MAX_REVEAL_PER_REQUEST = 10;
+
+// Waterfall searches outside Apollo's own database and is charged per record
+// found, so it is capped tighter still until the per-record price is known.
+export const MAX_WATERFALL_PER_REQUEST = 10;
+
+// Phone reveal is the most expensive thing this app can ask Apollo for: mobile
+// credits are charged per number and cost several times an email. So it is
+// capped tightest of all, and the remainder comes back as skippedIds for a
+// deliberate second pass rather than being spent on a single click.
+export const MAX_PHONE_PER_REQUEST = 5;
+
+// Apollo demands a webhook_url even when the caller polls for the result. Set
+// APOLLO_WEBHOOK_URL to an endpoint you control; the found addresses are
+// delivered there as well as being readable by polling.
+const WATERFALL_WEBHOOK_URL = (process.env.APOLLO_WEBHOOK_URL || '').trim();
+
+// Apollo delivers the found addresses by POSTing them to APOLLO_WEBHOOK_URL;
+// polling only returns a summary and the person ids. So results are kept here
+// as they arrive, keyed by the request id we issued. In memory on purpose: this
+// is a short-lived handoff, not a store of candidate data.
+const waterfallResults = new Map();
+// Only ids this server handed out are accepted, so a public webhook cannot be
+// used to inject arbitrary candidate records. The value is the question the
+// request asked - 'email' or 'phone' - because a phone job's answer says
+// nothing about a personal address, and reading one as the other would report
+// "no personal email found" for a job that never looked for one.
+const issuedWaterfallIds = new Map();
+const MAX_REMEMBERED_WATERFALLS = 200;
+
+function rememberWaterfall(requestId, kind) {
+  issuedWaterfallIds.set(requestId, kind);
+  // Bounded: drop the oldest rather than growing without limit.
+  while (issuedWaterfallIds.size > MAX_REMEMBERED_WATERFALLS) {
+    const oldest = issuedWaterfallIds.keys().next().value;
+    issuedWaterfallIds.delete(oldest);
+    waterfallResults.delete(oldest);
+  }
+}
 
 // Mirrors the client. Kept here so the API cannot be driven past the rule.
 const REQUIRED_FILTERS = ['jobTitle', 'location', 'keywords'];
@@ -19,6 +62,30 @@ const app = express();
 const allowedOrigins = (process.env.ALLOWED_ORIGIN || '').split(',').map((value) => value.trim()).filter(Boolean);
 if (allowedOrigins.length) app.use(cors({ origin: allowedOrigins }));
 
+// Apollo posts waterfall results here. Mounted with a text parser because the
+// payload carries a 64-bit request_id that JSON.parse would round away.
+app.post('/api/apollo/waterfall-webhook', express.text({ type: '*/*', limit: '1mb' }), (request, response) => {
+  const raw = typeof request.body === 'string' ? request.body : '';
+  const match = /"request_id"\s*:\s*"?(-?\d+)"?/.exec(raw);
+  const requestId = match ? match[1] : null;
+  // Unknown ids are acknowledged but ignored: this endpoint is public, and only
+  // jobs this server started may write into the store.
+  if (!requestId || !issuedWaterfallIds.has(requestId)) return response.status(202).json({ received: false });
+  const kind = issuedWaterfallIds.get(requestId);
+
+  let payload = null;
+  try { payload = JSON.parse(raw); } catch { payload = null; }
+  const result = payload?.webhook_result && typeof payload.webhook_result === 'object' ? payload.webhook_result : payload;
+  const people = Array.isArray(result?.people) ? result.people : (Array.isArray(result?.matches) ? result.matches : []);
+  // Read with the waterfall normalizer: a delivered payload carries the
+  // vendors' findings in `emails`/`phone_numbers`/`waterfall`, not in the
+  // enrichment fields, so the ordinary normalizer saw nothing in it.
+  waterfallResults.set(requestId, people
+    .filter((person) => person && (person.id || person.person_id))
+    .map((person) => normalizeWaterfallCandidate(person, { requestedId: person.id || person.person_id, kind })));
+  response.json({ received: true });
+});
+
 app.use(express.json({ limit: '32kb' }));
 
 function clean(value, max = 160) {
@@ -28,21 +95,36 @@ function clean(value, max = 160) {
 function publicError(error) {
   const messages = {
     MISSING_APOLLO_API_KEY: ['Apollo API is not configured on the server.', 503],
+    MISSING_LOOKUP_IDENTIFIER: ['Enter an email address, a LinkedIn URL, or a name to look one person up.', 400],
+    MISSING_APOLLO_WEBHOOK_URL: ['Set APOLLO_WEBHOOK_URL on the server before searching other data sources. Apollo requires one even when results are polled.', 503],
     APOLLO_AUTH: ['Apollo API authentication failed.', 502],
     APOLLO_RATE_LIMIT: ['Apollo API rate limit reached. Please try again later.', 429],
+    // Retrying cannot clear this, so the message says what to actually do
+    // instead of inviting another attempt.
+    APOLLO_CREDITS_EXHAUSTED: ['Your Apollo account has no credits left for this billing cycle. Add credits or upgrade the plan in Apollo, then try again.', 402],
     APOLLO_UNAVAILABLE: ['Unable to connect to Apollo. Please try again.', 502]
   };
-  return messages[error.message] || ['Unable to complete the Apollo request.', 502];
+  const [message, status] = messages[error.message] || ['Unable to complete the Apollo request.', 502];
+  // The code lets the client tell a permanent condition from a transient one
+  // without parsing prose. Only our own error names are ever exposed.
+  return [message, status, messages[error.message] ? error.message : 'APOLLO_ERROR'];
 }
 
 app.post('/api/candidates/search', async (request, response) => {
-  const filters = Object.fromEntries(['jobTitle', 'location', 'seniority', 'keywords', 'company', 'industry']
+  const filters = Object.fromEntries(['jobTitle', 'location', 'seniority', 'keywords', 'company', 'industry', 'personName']
     .map((key) => [key, clean(request.body?.[key])]));
   const page = Math.max(1, Math.min(1000, Number.parseInt(request.body?.page, 10) || 1));
+  // Costs nothing and keeps credits off candidates Apollo holds no address for.
+  // Defaults on: the caller must opt out deliberately.
+  const verifiedEmailOnly = request.body?.verifiedEmailOnly !== false;
   // Credit guard: Apollo bills for every search, so refuse one that cannot be
   // meaningful. Role, skills and location are required; company, industry and
   // seniority only narrow an already valid query.
-  const missing = REQUIRED_FILTERS.filter((key) => filters[key] === '');
+  //
+  // A name is exempt: looking a person up by name is a meaningful search in its
+  // own right, and demanding a role and a location alongside it is what made a
+  // name search return nothing. Apollo's q_person_name works on its own.
+  const missing = filters.personName ? [] : REQUIRED_FILTERS.filter((key) => filters[key] === '');
   if (missing.length) {
     return response.status(400).json({
       error: 'Role / job title, skills / keywords and location are required.',
@@ -50,29 +132,195 @@ app.post('/api/candidates/search', async (request, response) => {
     });
   }
   try {
-    const result = await searchPeople(filters, page);
+    const result = await searchPeople(filters, page, 25, { verifiedEmailOnly });
     response.json(result);
   } catch (error) {
-    const [message, status] = publicError(error);
-    response.status(status).json({ error: message });
+    const [message, status, code] = publicError(error);
+    response.status(status).json({ error: message, code });
   }
 });
 
-app.post('/api/candidates/enrich', async (request, response) => {
+// Looks one person up by the identifiers a recruiter already has, instead of
+// filtering a pool. Bounded at one person by Apollo's endpoint itself, so it
+// needs no per-request cap the way the batch routes do, and it never asks for
+// personal emails or a phone number - the recruiter reaches those through the
+// same explicit reveal as any other candidate.
+app.post('/api/candidates/lookup', async (request, response) => {
+  const identifiers = Object.fromEntries(['name', 'company', 'email', 'linkedinUrl']
+    .map((key) => [key, clean(request.body?.[key], key === 'linkedinUrl' ? 400 : 160)]));
+  // Refused here rather than sent: a lookup with nothing to match on would
+  // spend a request to be told what we already know.
+  if (!Object.values(identifiers).some(Boolean)) {
+    return response.status(400).json({ error: 'Enter an email address, a LinkedIn URL, or a name to look one person up.' });
+  }
+  // A company on its own identifies an employer, not a person, and Apollo would
+  // answer with whoever it happened to rank first.
+  if (!identifiers.email && !identifiers.linkedinUrl && !identifiers.name) {
+    return response.status(400).json({ error: 'A company on its own is not a person. Add a name, an email address, or a LinkedIn URL.' });
+  }
+  try {
+    const candidate = await matchPerson(identifiers);
+    // Apollo answering "no such person" is a result, not a failure, so it is a
+    // 200 with an empty candidate rather than an error the client must parse.
+    response.json({ candidate, matched: Boolean(candidate) });
+  } catch (error) {
+    const [message, status, code] = publicError(error);
+    response.status(status).json({ error: message, code });
+  }
+});
+
+// Both enrichment routes accept the same body, apply the same credit cap and
+// answer in the same shape. They differ only in whether Apollo was asked to
+// reveal personal emails, which spends extra credits per candidate.
+async function enrichRoute(request, response, { revealPersonalEmails, max }) {
   const requested = Array.isArray(request.body?.ids)
     ? [...new Set(request.body.ids.filter((id) => typeof id === 'string' && id.trim() !== '').map((id) => id.slice(0, 120)))]
     : [];
-  const ids = requested.slice(0, MAX_ENRICH_PER_REQUEST);
-  const skippedIds = requested.slice(MAX_ENRICH_PER_REQUEST);
+  const ids = requested.slice(0, max);
+  const skippedIds = requested.slice(max);
   if (!ids.length) return response.status(400).json({ error: 'Select at least one candidate to enrich.' });
   try {
-    const { candidates, failedIds } = await enrichPeople(ids);
+    const { candidates, failedIds } = await enrichPeople(ids, { revealPersonalEmails });
     // requestedIds lets the client resolve every selected ID to an outcome:
     // enriched, failed, or skipped by the per-request cap.
-    response.json({ requestedIds: ids, candidates, failedIds, skippedIds });
+    response.json({ requestedIds: ids, candidates, failedIds, skippedIds, revealedPersonalEmails: revealPersonalEmails === true });
   } catch (error) {
-    const [message, status] = publicError(error);
-    response.status(status).json({ error: message });
+    const [message, status, code] = publicError(error);
+    response.status(status).json({ error: message, code });
+  }
+}
+
+app.post('/api/candidates/enrich', (request, response) => enrichRoute(request, response, { revealPersonalEmails: false, max: MAX_ENRICH_PER_REQUEST }));
+
+// Costs more Apollo credits than /enrich, so it is a route of its own that the
+// recruiter reaches only through an explicit "Reveal contact details" action.
+// Nothing on the search path can reach it.
+app.post('/api/candidates/reveal', (request, response) => enrichRoute(request, response, { revealPersonalEmails: true, max: MAX_REVEAL_PER_REQUEST }));
+
+// Apollo delivers waterfall results by POST, and charges for what it finds
+// whether or not that delivery lands. A stale tunnel hostname or an unreachable
+// host therefore costs real money for data that is thrown away. So the URL is
+// tested before any search starts: a few hundred milliseconds against a credit.
+async function webhookUnreachableReason(url) {
+  if (!url) return 'not set';
+  let target;
+  try {
+    target = new URL(url);
+  } catch {
+    return 'not a valid URL';
+  }
+  if (target.protocol !== 'https:') return 'not an https:// URL, which Apollo requires';
+
+  try {
+    const probe = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // A request id this server never issued: the receiver acknowledges and
+      // discards it, so the probe cannot alter any stored result.
+      body: JSON.stringify({ request_id: 0, preflight: true }),
+      signal: AbortSignal.timeout(8000)
+    });
+    // Any answer at all proves Apollo can reach it. A 404 is the exact failure
+    // that silently loses results, so it is called out by name.
+    if (probe.status === 404) return 'reachable but returns 404 - it must point at this app\'s /api/apollo/waterfall-webhook';
+    if (probe.status >= 500) return `reachable but returns ${probe.status}, so Apollo cannot deliver to it`;
+    return null;
+  } catch (error) {
+    if (error?.name === 'TimeoutError') return 'unresponsive - it did not answer within 8 seconds';
+    // A hostname that no longer resolves is the common case with a quick
+    // tunnel: the hostname is issued per run and is gone once that run ends.
+    // Naming it saves hunting for a server fault behind an expired URL.
+    const code = error?.cause?.code || error?.code;
+    if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') {
+      return `pointing at a hostname that no longer exists (${target.hostname} does not resolve). A trycloudflare quick tunnel gets a new hostname every run, so restart the tunnel and put the new URL in .env`;
+    }
+    if (code === 'ECONNREFUSED') return 'refusing connections - nothing is listening at that address';
+    return `unreachable${code ? ` (${code})` : ''}`;
+  }
+}
+
+// Starts a waterfall search. Answers immediately with the request IDs to poll;
+// the addresses themselves arrive later.
+app.post('/api/candidates/waterfall', async (request, response) => {
+  const requested = Array.isArray(request.body?.ids)
+    ? [...new Set(request.body.ids.filter((id) => typeof id === 'string' && id.trim() !== '').map((id) => id.slice(0, 120)))]
+    : [];
+  const ids = requested.slice(0, MAX_WATERFALL_PER_REQUEST);
+  const skippedIds = requested.slice(MAX_WATERFALL_PER_REQUEST);
+  if (!ids.length) return response.status(400).json({ error: 'Select at least one candidate to search other data sources for.' });
+
+  // Checked before Apollo is called, so an unreachable webhook costs nothing.
+  const unreachable = await webhookUnreachableReason(WATERFALL_WEBHOOK_URL);
+  if (unreachable) {
+    return response.status(503).json({
+      error: `APOLLO_WEBHOOK_URL is ${unreachable}. Apollo posts the found addresses there and charges for them either way, so the search was not started and no credit was spent. Fix the URL in .env, then restart the API server - .env is only read when the process starts, so editing it alone changes nothing.`,
+      code: 'APOLLO_WEBHOOK_UNREACHABLE'
+    });
+  }
+
+  try {
+    const { requests, candidates, failedIds } = await requestWaterfallEmails(ids, WATERFALL_WEBHOOK_URL);
+    for (const job of requests) rememberWaterfall(job.requestId, 'email');
+    response.json({ requestedIds: ids, requests, candidates, failedIds, skippedIds });
+  } catch (error) {
+    const [message, status, code] = publicError(error);
+    response.status(status).json({ error: message, code });
+  }
+});
+
+// Asks Apollo for phone numbers. Answers immediately with the request IDs to
+// poll; the numbers themselves arrive later, at the webhook or by polling.
+//
+// This is the only route that ever sets reveal_phone_number, and it is reached
+// only from an explicit action the recruiter confirmed. Nothing on the search,
+// enrich, reveal or waterfall paths can trigger it.
+app.post('/api/candidates/phone', async (request, response) => {
+  const requested = Array.isArray(request.body?.ids)
+    ? [...new Set(request.body.ids.filter((id) => typeof id === 'string' && id.trim() !== '').map((id) => id.slice(0, 120)))]
+    : [];
+  const ids = requested.slice(0, MAX_PHONE_PER_REQUEST);
+  const skippedIds = requested.slice(MAX_PHONE_PER_REQUEST);
+  if (!ids.length) return response.status(400).json({ error: 'Select at least one candidate to reveal a phone number for.' });
+
+  // Checked before Apollo is called: Apollo delivers the numbers by POST and
+  // charges for them either way, so an unreachable webhook would cost mobile
+  // credits for data that is thrown away.
+  const unreachable = await webhookUnreachableReason(WATERFALL_WEBHOOK_URL);
+  if (unreachable) {
+    return response.status(503).json({
+      error: `APOLLO_WEBHOOK_URL is ${unreachable}. Apollo posts the phone numbers there and charges for them either way, so nothing was requested and no credit was spent. Fix the URL in .env, then restart the API server - .env is only read when the process starts, so editing it alone changes nothing.`,
+      code: 'APOLLO_WEBHOOK_UNREACHABLE'
+    });
+  }
+
+  try {
+    const { requests, candidates, failedIds } = await requestPhoneNumbers(ids, WATERFALL_WEBHOOK_URL);
+    for (const job of requests) rememberWaterfall(job.requestId, 'phone');
+    response.json({ requestedIds: ids, requests, candidates, failedIds, skippedIds });
+  } catch (error) {
+    const [message, status, code] = publicError(error);
+    response.status(status).json({ error: message, code });
+  }
+});
+
+// Reads one waterfall result. Costs no credits, so it is safe to poll.
+app.get('/api/candidates/waterfall/:requestId', async (request, response) => {
+  const requestId = String(request.params.requestId || '');
+  // Apollo's request ids are signed 64-bit integers; anything else is ours to
+  // reject rather than forward.
+  if (!/^-?\d{1,20}$/.test(requestId)) return response.status(400).json({ error: 'Unrecognised waterfall request.' });
+  // Anything the webhook already delivered wins: it is the only copy that
+  // carries the addresses themselves.
+  // Only this server knows which question a request asked; Apollo's answer for
+  // a job that found nothing looks the same either way.
+  const kind = issuedWaterfallIds.get(requestId) || 'email';
+  const delivered = waterfallResults.get(requestId);
+  if (delivered) return response.json({ status: 'ready', kind, candidates: delivered, deliveredByWebhook: true });
+  try {
+    response.json({ kind, ...await pollWaterfallResult(requestId, { kind }) });
+  } catch (error) {
+    const [message, status, code] = publicError(error);
+    response.status(status).json({ error: message, code });
   }
 });
 
