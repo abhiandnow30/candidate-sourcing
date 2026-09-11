@@ -51,7 +51,13 @@ function rememberWaterfall(requestId, kind) {
 }
 
 // Mirrors the client. Kept here so the API cannot be driven past the rule.
-const REQUIRED_FILTERS = ['jobTitle', 'location', 'keywords'];
+//
+// Location, plus at least one of role or skills. Skills used to be required
+// alongside the role, which made the most destructive filter compulsory:
+// measured against the live API, one keyword cut a 3,088-candidate pool to 9,
+// and a role on its own is a perfectly meaningful search.
+const REQUIRED_FILTERS = ['location'];
+const REQUIRED_EITHER = ['jobTitle', 'keywords'];
 
 const app = express();
 
@@ -112,11 +118,17 @@ function publicError(error) {
 
 app.post('/api/candidates/search', async (request, response) => {
   const filters = Object.fromEntries(['jobTitle', 'location', 'seniority', 'keywords', 'company', 'industry', 'personName']
-    .map((key) => [key, clean(request.body?.[key])]));
+    // Role and skills are comma-separated lists, so they need more room than a
+    // single value; the rest keep the original bound.
+    .map((key) => [key, clean(request.body?.[key], key === 'jobTitle' || key === 'keywords' ? 400 : 160)]));
   const page = Math.max(1, Math.min(1000, Number.parseInt(request.body?.page, 10) || 1));
   // Costs nothing and keeps credits off candidates Apollo holds no address for.
   // Defaults on: the caller must opt out deliberately.
   const verifiedEmailOnly = request.body?.verifiedEmailOnly !== false;
+  // Off by default: "any of these skills" finds people, "all of them" finds
+  // almost nobody, and the recruiter should reach the strict version
+  // deliberately rather than land on it.
+  const matchAllSkills = request.body?.matchAllSkills === true;
   // Credit guard: Apollo bills for every search, so refuse one that cannot be
   // meaningful. Role, skills and location are required; company, industry and
   // seniority only narrow an already valid query.
@@ -125,14 +137,16 @@ app.post('/api/candidates/search', async (request, response) => {
   // own right, and demanding a role and a location alongside it is what made a
   // name search return nothing. Apollo's q_person_name works on its own.
   const missing = filters.personName ? [] : REQUIRED_FILTERS.filter((key) => filters[key] === '');
+  // A location on its own describes a city, not a search.
+  if (!filters.personName && REQUIRED_EITHER.every((key) => filters[key] === '')) missing.push(...REQUIRED_EITHER);
   if (missing.length) {
     return response.status(400).json({
-      error: 'Role / job title, skills / keywords and location are required.',
+      error: 'Location is required, along with a role or at least one skill.',
       missing
     });
   }
   try {
-    const result = await searchPeople(filters, page, 25, { verifiedEmailOnly });
+    const result = await searchPeople(filters, page, 25, { verifiedEmailOnly, matchAllSkills });
     response.json(result);
   } catch (error) {
     const [message, status, code] = publicError(error);

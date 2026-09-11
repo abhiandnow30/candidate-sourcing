@@ -207,3 +207,27 @@ footer { border-top: 1px solid var(--line); margin-top: 44px; padding-top: 18px;
 .row-search-actions { display: flex; align-items: center; gap: 16px; margin-top: 10px; }
 .row-search .hint strong { color: var(--ink); }
 .name-scope { margin-top: 12px; }
+.scope-field { margin-bottom: 14px; }
+.scope-field .search-scope { margin-bottom: 0; }
+.scope-field .hint { margin-top: 6px; max-width: 62ch; }
+.refine-trail li em { font-style: normal; color: #a4aaa0; }
+.row-search label { flex-wrap: wrap; }
+.row-search .link-button { flex: none; }
+.spend-note { margin: 0 0 14px; max-width: 70ch; }
+.trail-label { display: block; font-family: 'DM Mono', monospace; text-transform: uppercase; letter-spacing: .07em; font-size: 10px; color: var(--muted); margin-bottom: 8px; }
+/* Which of the requested skills a candidate actually matched. */
+.matched-skills { display: flex; flex-wrap: wrap; gap: 5px; list-style: none; padding: 0; margin: 4px 0 0; }
+.matched-skills li { font-size: 10px; padding: 2px 6px; border: 1px solid #bcd7ac; background: #e4f0dc; color: #3c6b32; }
+.skills-mode { margin: 14px 0 4px; }
+
+/* Role suggestions. The browser's own datalist cannot be styled, opens at full
+   page height and mixes in autofill history, so the list is ours. */
+.form-grid label:has(.role-list), .form-grid label:has(.role-toggle) { position: relative; }
+.role-toggle { position: absolute; right: 0; bottom: 6px; border: 0; background: none; color: var(--muted); font-size: 12px; padding: 4px 6px; line-height: 1; }
+.role-toggle:hover { color: var(--ink); }
+.role-list { position: absolute; top: 100%; left: 0; right: 0; z-index: 5; margin: 2px 0 0; padding: 4px; list-style: none; max-height: 232px; overflow-y: auto; background: white; border: 1px solid var(--line-strong, #b7beb2); box-shadow: 0 6px 18px rgba(20, 30, 20, .10); }
+.role-list li + li { border-top: 1px solid #f0f2ee; }
+.role-list button { display: block; width: 100%; text-align: left; border: 0; background: none; padding: 7px 9px; font-size: 12px; font-family: inherit; color: var(--ink); }
+.role-list button:hover, .role-list button:focus-visible { background: #e4f0dc; color: #3c6b32; outline: none; }
+.form-grid label:has(.role-list) { position: relative; }
+.role-list-note { padding: 6px 9px; font-family: 'DM Mono', monospace; font-size: 9px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); border-bottom: 1px solid var(--line); }

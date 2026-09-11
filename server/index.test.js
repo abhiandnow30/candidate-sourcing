@@ -67,21 +67,21 @@ test('search returns normalized candidates through our backend', async () => {
   });
 });
 
-test('search requires role, skills and location before calling Apollo', async () => {
+test('search requires a location and either a role or a skill', async () => {
   const complete = { jobTitle: 'Java Developer', location: 'Delhi', keywords: 'Java' };
   await withServer(() => ok({ people: [] }), async ({ post, apolloCalls }) => {
     const cases = [
-      [{}, ['jobTitle', 'location', 'keywords']],
-      [{ page: 1 }, ['jobTitle', 'location', 'keywords']],
-      [{ ...complete, jobTitle: '' }, ['jobTitle']],
+      [{}, ['location', 'jobTitle', 'keywords']],
+      [{ page: 1 }, ['location', 'jobTitle', 'keywords']],
       [{ ...complete, location: '   ' }, ['location']],
-      [{ ...complete, keywords: '' }, ['keywords']],
-      [{ seniority: 'senior', company: 'Example Co', industry: 'Software' }, ['jobTitle', 'location', 'keywords']]
+      // A location on its own describes a city, not a search.
+      [{ location: 'Delhi' }, ['jobTitle', 'keywords']],
+      [{ location: 'Delhi', seniority: 'senior', company: 'Example Co' }, ['jobTitle', 'keywords']]
     ];
     for (const [payload, expectedMissing] of cases) {
       const { status, body } = await post('/api/candidates/search', payload);
       assert.equal(status, 400, JSON.stringify(payload));
-      assert.equal(body.error, 'Role / job title, skills / keywords and location are required.');
+      assert.equal(body.error, 'Location is required, along with a role or at least one skill.');
       assert.deepEqual(body.missing, expectedMissing);
     }
     assert.equal(apolloCalls.length, 0, 'no credit is spent on a query that cannot be meaningful');
@@ -761,4 +761,115 @@ test('an expired tunnel hostname is named as one, not reported as a vague failur
     await new Promise((resolve) => server.close(resolve));
     delete process.env.APOLLO_WEBHOOK_URL;
   }
+});
+
+test('a role alone is a valid search, and so are skills alone', async () => {
+  // Skills used to be compulsory, which forced the most destructive filter on
+  // every query: measured live, one keyword cut a 3,088-candidate pool to 9.
+  await withServer(() => ok({ people: [{ id: 'person-1', name: 'Test Candidate' }], total_entries: 645 }),
+    async ({ post, apolloCalls }) => {
+      const roleOnly = await post('/api/candidates/search', { jobTitle: 'AI/ML Engineer', location: 'Hyderabad' });
+      assert.equal(roleOnly.status, 200);
+      assert.equal(roleOnly.body.total, 645);
+      assert.deepEqual(apolloCalls[0].body.person_titles, ['AI/ML Engineer']);
+      assert.equal('q_keywords' in apolloCalls[0].body, false, 'no skill was given, so none is sent');
+
+      const skillsOnly = await post('/api/candidates/search', { keywords: 'Python', location: 'Hyderabad' });
+      assert.equal(skillsOnly.status, 200);
+      assert.equal(apolloCalls[1].body.q_keywords, 'Python');
+      assert.equal('person_titles' in apolloCalls[1].body, false, 'no role was given, so none is sent');
+    });
+});
+
+test('a comma-separated role becomes an OR of job titles', async () => {
+  // person_titles is an OR at Apollo, so more titles widen the pool - measured,
+  // one title returned 645 and four returned 3,088. That is the opposite of
+  // how keywords behave, and it is what covers a role with many names.
+  await withServer(() => ok({ people: [], total_entries: 3088 }), async ({ post, apolloCalls }) => {
+    await post('/api/candidates/search', {
+      jobTitle: 'AI/ML Engineer, Machine Learning Engineer , Data Scientist,, AI/ML Engineer',
+      location: 'Hyderabad'
+    });
+    // Trimmed, de-duplicated, and empty entries dropped.
+    assert.deepEqual(apolloCalls[0].body.person_titles,
+      ['AI/ML Engineer', 'Machine Learning Engineer', 'Data Scientist']);
+  });
+});
+
+test('several skills are asked for one at a time and merged, never ANDed', async () => {
+  // Apollo has no OR: "python OR llm" matches the literal word "or" and returns
+  // nothing, and several words in q_keywords means "all of them". So each skill
+  // is its own request and the answers are unioned.
+  const bySkill = {
+    Python: [{ id: 'p1', name: 'One' }, { id: 'p2', name: 'Two' }],
+    LLM: [{ id: 'p2', name: 'Two' }, { id: 'p3', name: 'Three' }],
+    'Machine Learning': [{ id: 'p2', name: 'Two' }]
+  };
+  await withServer(({ body }) => ok({
+    people: bySkill[body.q_keywords] || [],
+    total_entries: (bySkill[body.q_keywords] || []).length
+  }), async ({ post, apolloCalls }) => {
+    const { body } = await post('/api/candidates/search', {
+      jobTitle: 'AI/ML Engineer', keywords: 'Python, LLM, Machine Learning', location: 'Hyderabad'
+    });
+
+    // One request per skill, each carrying the whole skill and nothing else.
+    assert.equal(apolloCalls.length, 3);
+    assert.deepEqual(apolloCalls.map((call) => call.body.q_keywords), ['Python', 'LLM', 'Machine Learning']);
+    // A multi-word skill stays one skill, not two separate requirements.
+    assert.equal(apolloCalls[2].body.q_keywords, 'Machine Learning');
+    // The role travels with every one of them, and is never rewritten by the
+    // skills: a Software Engineer who works in Python is still a Python match.
+    for (const call of apolloCalls) assert.deepEqual(call.body.person_titles, ['AI/ML Engineer']);
+
+    // Anyone matching any skill is kept, strongest match first.
+    assert.deepEqual(body.candidates.map((candidate) => candidate.name), ['Two', 'One', 'Three']);
+    assert.deepEqual(body.candidates[0].matchedSkills, ['Python', 'LLM', 'Machine Learning']);
+    assert.deepEqual(body.candidates[1].matchedSkills, ['Python']);
+    assert.deepEqual(body.candidates[2].matchedSkills, ['LLM']);
+    // Summing per-skill totals would count "Two" three times, so no total is
+    // claimed; what Apollo actually said is passed through instead.
+    assert.equal(body.total, null);
+    assert.deepEqual(body.skillTotals, [
+      { skill: 'Python', total: 2 }, { skill: 'LLM', total: 2 }, { skill: 'Machine Learning', total: 1 }
+    ]);
+  });
+});
+
+test('a skills search is capped so one query cannot fan out without limit', async () => {
+  const { MAX_SKILL_QUERIES } = await import('./apolloService.js');
+  await withServer(() => ok({ people: [] }), async ({ post, apolloCalls }) => {
+    await post('/api/candidates/search', { keywords: 'a, b, c, d, e, f, g, h', location: 'Hyderabad' });
+    assert.equal(apolloCalls.length, MAX_SKILL_QUERIES);
+  });
+});
+
+test('matchAllSkills asks Apollo for every skill in one request', async () => {
+  await withServer(() => ok({ people: [{ id: 'p1', name: 'Both' }], total_entries: 3 }),
+    async ({ post, apolloCalls }) => {
+      const { body } = await post('/api/candidates/search', {
+        keywords: 'python, c++', location: 'hyderabad', matchAllSkills: true
+      });
+      // One request, both skills in it: Apollo ANDs the words natively.
+      assert.equal(apolloCalls.length, 1);
+      assert.equal(apolloCalls[0].body.q_keywords, 'python c++');
+      // And a single request means a real total, unlike the merged union.
+      assert.equal(body.total, 3);
+      assert.equal(body.matchedAllSkills, true);
+      assert.deepEqual(body.candidates[0].matchedSkills, ['python', 'c++']);
+      assert.deepEqual(body.skillTotals, [{ skill: 'python + c++', total: 3 }]);
+    });
+});
+
+test('matchAllSkills is off unless it is asked for', async () => {
+  await withServer(() => ok({ people: [], total_entries: 0 }), async ({ post, apolloCalls }) => {
+    await post('/api/candidates/search', { keywords: 'python, c++', location: 'hyderabad' });
+    // Two skills, two requests: the default is "any of them".
+    assert.equal(apolloCalls.length, 2);
+    for (const value of [undefined, false, 'true', 1]) {
+      apolloCalls.length = 0;
+      await post('/api/candidates/search', { keywords: 'python, c++', location: 'hyderabad', matchAllSkills: value });
+      assert.equal(apolloCalls.length, 2, `matchAllSkills: ${JSON.stringify(value)} is not a true boolean`);
+    }
+  });
 });

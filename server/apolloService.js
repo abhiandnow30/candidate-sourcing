@@ -269,26 +269,122 @@ export function batchIds(ids, size = BULK_MATCH_BATCH_SIZE) {
 // has no address for at all.
 const REACHABLE_EMAIL_STATUSES = ['verified', 'likely to engage'];
 
-export async function searchPeople(filters, page = 1, perPage = 25, { verifiedEmailOnly = false } = {}) {
+// Splits a comma-separated field into trimmed, de-duplicated values. Commas,
+// not spaces: "Machine Learning" is one skill, not two.
+export function splitList(value) {
+  if (Array.isArray(value)) return [...new Set(value.map((item) => String(item).trim()).filter(Boolean))];
+  if (typeof value !== 'string') return [];
+  return [...new Set(value.split(',').map((item) => item.trim()).filter(Boolean))];
+}
+
+// How many skills one search will ask Apollo about. Each is its own request,
+// because Apollo has no way to express "or" within a single one.
+export const MAX_SKILL_QUERIES = 5;
+
+// Everything except the skills, which are the one criterion Apollo cannot take
+// as a set. Titles go in as a list because person_titles is an OR: adding
+// "Data Scientist" alongside "AI/ML Engineer" widens the pool rather than
+// narrowing it, which is the opposite of how keywords behave.
+function searchBody(filters, page, perPage, verifiedEmailOnly) {
   const body = { page, per_page: perPage };
   if (verifiedEmailOnly) body.contact_email_status = REACHABLE_EMAIL_STATUSES;
   // Apollo's own name filter, which searches the whole pool rather than the
   // page in hand. Without it, looking for one person means paging through
   // every result by hand.
   if (filters.personName) body.q_person_name = filters.personName;
-  if (filters.jobTitle) body.person_titles = [filters.jobTitle];
+  const titles = splitList(filters.jobTitle);
+  if (titles.length) body.person_titles = titles;
   if (filters.location) body.person_locations = [filters.location];
   if (filters.seniority) body.person_seniorities = [filters.seniority];
-  if (filters.keywords) body.q_keywords = filters.keywords;
+  // organization_names is accepted but does nothing: measured against the live
+  // API, a real company, another real company and a nonsense string all
+  // returned the identical count to sending no filter at all. It is kept only
+  // so an existing caller does not break, and the UI no longer offers it.
   if (filters.company) body.organization_names = [filters.company];
+  // organization_industries works, but only for Apollo's own taxonomy names -
+  // "computer software" and "banking" match, "information technology" does not
+  // and silently returns nothing. It needs a validated list, not free text.
   if (filters.industry) body.organization_industries = [filters.industry];
-  const result = await apolloRequest('/mixed_people/api_search', body);
-  const people = result.people || result.contacts || [];
+  return body;
+}
+
+function readTotal(result) {
+  return firstValue(result.total_entries, result.total_results, result.pagination?.total_entries);
+}
+
+// Searches for people matching the filters, and possessing any of the skills.
+//
+// Apollo offers no way to ask for "any of these skills" in one request:
+// q_keywords is a single string whose words are ANDed, there is no OR operator
+// (verified: "python OR llm" returns nothing, matching the literal word "or"),
+// quoting changes nothing, and no skills parameter exists. Asking for several
+// skills at once therefore means "has every one of them", which in practice
+// returns nobody - measured, three skills took a 3,088-candidate pool to zero.
+//
+// So each skill is asked for separately and the answers are merged. A candidate
+// is kept if any skill matched, and carries the list of the ones that did, so
+// the strongest matches can be told from the weakest. Skills never touch
+// person_titles: a Software Engineer who works in Python is still a Python
+// candidate, whatever the Role field says.
+export async function searchPeople(filters, page = 1, perPage = 25, { verifiedEmailOnly = false, matchAllSkills = false } = {}) {
+  const skills = splitList(filters.keywords).slice(0, MAX_SKILL_QUERIES);
+
+  // One request answers exactly two cases: no skills or one, and "must have
+  // every skill". The second is Apollo's native behaviour - several words in
+  // q_keywords are ANDed - so asking for all of them at once is both correct
+  // and the only way to get a true total for it. Merging the per-skill answers
+  // instead would only find the people who happened to appear in every page.
+  if (skills.length <= 1 || matchAllSkills) {
+    const body = searchBody(filters, page, perPage, verifiedEmailOnly);
+    if (skills.length) body.q_keywords = skills.join(' ');
+    const result = await apolloRequest('/mixed_people/api_search', body);
+    const people = result.people || result.contacts || [];
+    return {
+      candidates: people.map((person) => ({ ...normalizeCandidate(person), matchedSkills: skills })),
+      page,
+      perPage,
+      total: readTotal(result),
+      skillTotals: skills.length ? [{ skill: skills.join(' + '), total: readTotal(result) }] : [],
+      // Says which question was asked, so the results can describe themselves.
+      matchedAllSkills: skills.length > 1
+    };
+  }
+
+  const found = new Map();
+  const skillTotals = [];
+  for (const skill of skills) {
+    const result = await apolloRequest('/mixed_people/api_search', {
+      ...searchBody(filters, page, perPage, verifiedEmailOnly),
+      q_keywords: skill
+    });
+    const people = result.people || result.contacts || [];
+    skillTotals.push({ skill, total: readTotal(result) ?? 0 });
+    for (const person of people) {
+      const candidate = normalizeCandidate(person);
+      // Apollo returns an id on every search row; the name/company pair is only
+      // a fallback so a row without one is still merged rather than duplicated.
+      const key = candidate.id || `${candidate.name || ''}|${candidate.company || ''}`;
+      const existing = found.get(key);
+      if (existing) existing.matchedSkills.push(skill);
+      else found.set(key, { ...candidate, matchedSkills: [skill] });
+    }
+  }
+
+  // Most skills matched first, so the closest fits are at the top. Apollo's own
+  // order is kept among candidates that matched the same number.
+  const candidates = [...found.values()]
+    .sort((left, right) => right.matchedSkills.length - left.matchedSkills.length);
+
   return {
-    candidates: people.map((person) => normalizeCandidate(person)),
+    candidates,
     page,
     perPage,
-    total: firstValue(result.total_entries, result.total_results, result.pagination?.total_entries)
+    // Deliberately null: the union of several searches has no total Apollo can
+    // give us, and summing the per-skill totals would double-count everyone who
+    // matched more than one. skillTotals carries what Apollo actually said.
+    total: null,
+    skillTotals,
+    matchedAllSkills: false
   };
 }
 

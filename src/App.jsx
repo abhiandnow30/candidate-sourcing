@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
-  ENRICHED, ENRICHING, FAILED, NOT_ENRICHED, REVEALING, REVEALING_PHONE, SEARCHING_SOURCES,
+  ENRICHED, ENRICHING, FAILED, NOT_ENRICHED, REVEALING, REVEALING_PHONE,
   applyEnriched, applyStates, applyWaterfall, enrichmentLabel, enrichmentSummary, idsToEnrich, idsToReveal,
   idsToRevealPhone, markState, reconcile, revealSummary, stateOf
 } from './enrichment.js';
@@ -8,39 +8,112 @@ import {
 // personName is not one of the form fields: it is driven by the results search
 // box, because that is where a recruiter is when they realise the person they
 // want is on one of the other pages.
-const initialFilters = { jobTitle: '', location: '', seniority: '', keywords: '', company: '', industry: '', personName: '' };
+const initialFilters = { jobTitle: '', location: '', seniority: '', keywords: '', personName: '' };
 // Role, skills and location are required; the rest narrow an already
 // meaningful search. Apollo bills for every search, so a query without these
 // three is not worth sending.
-const REQUIRED_FILTERS = ['jobTitle', 'location', 'keywords'];
-const fields = [
-  ['jobTitle', 'Role / Job Title', 'e.g. Senior Java Developer', true],
-  ['location', 'Location', 'e.g. Hyderabad, India', true],
-  ['keywords', 'Skills / Keywords', 'e.g. Java, Spring Boot', true],
-  ['company', 'Company', 'Optional', false],
-  ['industry', 'Industry', 'Optional', false]
-];
-const FIELD_LABELS = Object.fromEntries(fields.map(([name, label]) => [name, label.toLowerCase()]));
+// Location, plus a role or at least one skill. Skills were compulsory, which
+// forced the most destructive filter onto every search.
+const REQUIRED_FILTERS = ['location'];
+const REQUIRED_EITHER = ['jobTitle', 'keywords'];
 
-// The other way in: a recruiter who already knows who they want does not need
-// to filter a pool to find them. Apollo matches one person from any of these,
-// so none is required on its own - but a company alone identifies an employer
-// rather than a person, so it cannot be the only thing given.
-const initialLookup = { name: '', company: '', email: '', linkedinUrl: '' };
-const lookupFields = [
-  ['name', 'Name', 'e.g. Jane Doe'],
-  ['company', 'Company', 'Optional, narrows a common name'],
-  ['email', 'Email address', 'e.g. jane@example.com'],
-  // The placeholder deliberately spells out no LinkedIn path: shipped frontend
-  // source hardcodes no LinkedIn endpoint, and a guard test enforces that.
-  ['linkedinUrl', 'LinkedIn URL', 'Paste the full profile URL']
+// Commas, not spaces: "Machine Learning" is one skill.
+function splitList(value) {
+  return value.split(',').map((item) => item.trim()).filter(Boolean);
+}
+const fields = [
+  ['jobTitle', 'Role / Job Title', 'e.g. Data Scientist', false],
+  ['location', 'Location', 'e.g. Hyderabad', true],
+  ['keywords', 'Skills', 'e.g. Python, LLM, Machine Learning', false],
 ];
-// A company is deliberately not here: on its own it is not a person.
-const LOOKUP_IDENTIFIERS = ['name', 'email', 'linkedinUrl'];
+
+// Company and Industry were here and are gone, both measured against the live
+// API rather than judged by eye:
+//
+//   organization_names is ignored outright - "Infosys", "Tata Consultancy
+//   Services" and "zzz-does-not-exist" all returned the same 21,081 as no
+//   filter at all, so the field could never do anything.
+//
+//   organization_industries works only for Apollo's own taxonomy names:
+//   "computer software" 10,086 and "banking" 569, but "information technology"
+//   and "staffing and recruiting" both 0. As free text it was a way to empty a
+//   search with no explanation, the same trap the junior seniority was. It
+//   could come back as a validated dropdown; as a text box it could not.
+
+const FIELD_LABELS = Object.fromEntries(fields.map(([name, label]) => [name, label.toLowerCase()]));
 
 // How many past queries to keep in the refine trail. Enough to see which skill
 // narrowed the pool, short enough not to become a wall of numbers.
 const REFINE_TRAIL_LENGTH = 6;
+
+// The seniority levels a technical hire actually sits at, measured against the
+// live API for python developer, java developer and data scientist in one city:
+//
+//   entry 209/514/917 · senior 15/72/438 · manager 7/16/146 · intern 2/1/2
+//   head, director, partner 0/0/0 · vp, c_suite, owner, founder 0-6
+//
+// Apollo's remaining levels are its sales-prospecting tiers and return nothing
+// for engineering titles, so offering them is a way to get an empty result.
+// "junior" and "mid_level" were offered here and are not Apollo values at all -
+// picking either took any search to zero with no explanation.
+const SENIORITIES = [
+  ['intern', 'Intern'],
+  ['entry', 'Entry'],
+  ['senior', 'Senior'],
+  ['manager', 'Manager']
+];
+
+// Suggested job titles, each verified against the live API to return a real
+// pool rather than nothing. Offered as suggestions, not as the only choices:
+// Apollo knows thousands of titles, and the field still takes anything typed
+// into it - including several separated by commas, which Apollo ORs.
+const ROLE_SUGGESTIONS = [
+  'Software Engineer', 'Full Stack Developer', 'Backend Developer', 'Frontend Developer',
+  'Python Developer', 'Java Developer', 'Android Developer', 'iOS Developer',
+  'Data Scientist', 'Data Engineer', 'AI/ML Engineer', 'Machine Learning Engineer',
+  'DevOps Engineer', 'Cloud Engineer', 'QA Engineer', 'Test Engineer',
+  'UI/UX Designer', 'Business Analyst', 'Project Manager', 'Product Manager',
+  'HR Executive', 'Sales Executive'
+];
+
+// Skills worth suggesting for each role, every one measured against the live
+// API for a real pool in one city rather than guessed at. The number after each
+// is what Apollo held for it alone:
+//
+//   java 835 · aws 717 · azure 663 · sql 530 · python 297 · react 131 ·
+//   angular 92 · machine learning 381 · data science 510 · llm 25 ·
+//   devops 3125 · automation 2218 · testing 575 · sales 10678 · agile 359
+//
+// Skills that returned nothing at all - tensorflow and figma among them - are
+// deliberately absent: suggesting one is handing over an empty search. The
+// field still takes anything typed into it.
+const SKILLS_BY_ROLE = {
+  'software engineer': ['java', 'python', 'sql', 'aws', 'javascript', 'agile'],
+  'full stack developer': ['javascript', 'react', 'angular', 'java', 'sql', 'aws'],
+  'backend developer': ['java', 'python', 'sql', 'spring boot', 'aws'],
+  'frontend developer': ['javascript', 'react', 'angular', 'typescript'],
+  'python developer': ['python', 'django', 'sql', 'aws', 'machine learning'],
+  'java developer': ['java', 'spring boot', 'sql', 'aws'],
+  'android developer': ['android', 'java', 'kotlin'],
+  'ios developer': ['ios', 'swift'],
+  'data scientist': ['python', 'machine learning', 'data science', 'sql', 'deep learning', 'nlp'],
+  'data engineer': ['sql', 'python', 'aws', 'azure', 'data science'],
+  'ai/ml engineer': ['machine learning', 'python', 'deep learning', 'llm', 'nlp'],
+  'machine learning engineer': ['machine learning', 'python', 'deep learning', 'llm', 'nlp'],
+  'devops engineer': ['devops', 'aws', 'azure', 'kubernetes', 'jenkins', 'terraform'],
+  'cloud engineer': ['aws', 'azure', 'kubernetes', 'devops'],
+  'qa engineer': ['testing', 'automation', 'selenium', 'agile'],
+  'test engineer': ['testing', 'automation', 'selenium'],
+  'ui/ux designer': ['user experience', 'agile'],
+  'business analyst': ['business analysis', 'sql', 'data analysis', 'agile', 'excel'],
+  'project manager': ['project management', 'agile'],
+  'product manager': ['product management', 'agile'],
+  'hr executive': ['recruitment', 'communication'],
+  'sales executive': ['sales', 'communication', 'salesforce']
+};
+
+// Shown when no role is chosen, or a role nothing is mapped for.
+const COMMON_SKILLS = ['python', 'java', 'sql', 'aws', 'machine learning', 'testing', 'agile'];
 
 const NOT_AVAILABLE = 'Not available';
 const DEFAULT_PER_PAGE = 25;
@@ -87,10 +160,9 @@ function personalEmailOf(candidate) {
 // running says so; a finished one that found nothing says that, because a
 // successful search with no result is a real answer and not a failure; and a
 // candidate nobody has asked about stays "Not available".
-function PersonalEmailStatus({ candidate, state }) {
+function PersonalEmailStatus({ candidate }) {
   const personal = personalEmailOf(candidate);
   if (personal) return <a href={`mailto:${personal}`}>{personal}</a>;
-  if (state === SEARCHING_SOURCES) return <span className="muted">Checking for personal email...</span>;
   if (candidate.waterfallChecked) return <span className="muted">No personal email found</span>;
   return <Unavailable />;
 }
@@ -109,35 +181,18 @@ function PhoneStatus({ candidate, state }) {
 // suppressed when the primary line is already showing the personal address, so
 // the same value is never displayed twice under two labels, and it stays hidden
 // for a candidate no search of other sources has touched.
-function showPersonalLine(candidate, state) {
+function showPersonalLine(candidate) {
   if (candidate.emailType === 'personal') return false;
-  return Boolean(candidate.personalEmail) || Boolean(candidate.waterfallChecked) || state === SEARCHING_SOURCES;
+  return Boolean(candidate.personalEmail) || Boolean(candidate.waterfallChecked);
 }
 
-// Matches a row against what the recruiter typed into the results search box.
-//
-// Only the fields a pool row actually carries are searched. Apollo returns no
-// skills, headline or location on a search result - measured: empty on all 25
-// rows - so offering to search those would find nothing every time and read as
-// a broken box rather than an empty pool. Addresses are included because after
-// a reveal they are the thing worth finding a person by.
+// Matches a row against the name the recruiter typed. Name only: the box exists
+// to find one candidate, and matching companies or job titles as well meant a
+// company name could pull up people the recruiter was not looking for.
 function matchesRowQuery(candidate, query) {
   const needle = query.trim().toLowerCase();
   if (!needle) return true;
-  return [candidate.name, candidate.title, candidate.company, candidate.email, candidate.personalEmail]
-    .some((value) => typeof value === 'string' && value.toLowerCase().includes(needle));
-}
-
-// A candidate Apollo was actually asked about, where the answer was "no personal
-// address". Only these are hidden by the filter.
-//
-// It turns on contactRevealed, not enriched. Plain enrichment sends
-// reveal_personal_emails: false, so an enriched candidate has never been asked
-// and its blank personal field means "unknown", not "none". Treating those two
-// as the same thing told recruiters Apollo had returned no personal address for
-// people Apollo was never asked about.
-function knownWithoutPersonalEmail(candidate) {
-  return Boolean(candidate.contactRevealed) && !personalEmailOf(candidate);
+  return typeof candidate.name === 'string' && candidate.name.toLowerCase().includes(needle);
 }
 
 // Our backend always answers with JSON, but a proxy or gateway in front of it
@@ -236,8 +291,8 @@ function EnrichedDetails({ candidate, onRefresh, onReveal, busy, revealing, stat
       <DetailField label="Current employment"><EmploymentList roles={current} /></DetailField>
       <DetailField label="Previous employment"><EmploymentList roles={previous} /></DetailField>
       <DetailField label={emailLabel(candidate)}><ContactValue value={candidate.email} available={candidate.emailAvailable} href={candidate.email ? `mailto:${candidate.email}` : undefined} /></DetailField>
-      {showPersonalLine(candidate, state) && <DetailField label="Personal email">
-        <PersonalEmailStatus candidate={candidate} state={state} />
+      {showPersonalLine(candidate) && <DetailField label="Personal email">
+        <PersonalEmailStatus candidate={candidate} />
       </DetailField>}
       <DetailField label="Phone"><PhoneStatus candidate={candidate} state={state} /></DetailField>
       <DetailField label="LinkedIn">
@@ -266,13 +321,16 @@ function CandidateBlock({ candidate, selected, selectable, state, expanded, busy
       <div className="identity">
         <strong>{name}</strong>
         <span>{valueOrUnavailable(candidate.title)}</span>
+        {(candidate.matchedSkills || []).length > 0 && <ul className="matched-skills">
+          {candidate.matchedSkills.map((skill) => <li key={skill}>{skill}</li>)}
+        </ul>}
       </div>
       <div data-label="Company">{valueOrUnavailable(candidate.company)}</div>
       <div data-label="Location">{valueOrUnavailable(candidate.location)}</div>
       <div className="contact" data-label="Contact">
         <ContactLine label={emailLabel(candidate)}><ContactValue value={candidate.email} available={candidate.emailAvailable} href={candidate.email ? `mailto:${candidate.email}` : undefined} /></ContactLine>
-        {showPersonalLine(candidate, state) && <ContactLine label="Personal">
-          <PersonalEmailStatus candidate={candidate} state={state} />
+        {showPersonalLine(candidate) && <ContactLine label="Personal">
+          <PersonalEmailStatus candidate={candidate} />
         </ContactLine>}
         <ContactLine label="Phone"><PhoneStatus candidate={candidate} state={state} /></ContactLine>
         <ContactLine label="LinkedIn">
@@ -295,7 +353,7 @@ function CandidateBlock({ candidate, selected, selectable, state, expanded, busy
     </article>
     {/* Kept open through a reveal so the panel does not vanish under the
         recruiter the moment they click the button inside it. */}
-    {expanded && (state === ENRICHED || state === REVEALING || state === SEARCHING_SOURCES || state === REVEALING_PHONE) && candidate.enriched
+    {expanded && (state === ENRICHED || state === REVEALING || state === REVEALING_PHONE) && candidate.enriched
       && <EnrichedDetails
         candidate={candidate}
         onRefresh={onRefresh}
@@ -327,112 +385,84 @@ export default function App() {
   const [total, setTotal] = useState(null);
   const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState('');
-  // A reveal spends real money, so it waits here for a deliberate confirmation
-  // instead of firing on the first click.
-  const [pendingReveal, setPendingReveal] = useState(null);
   // Apollo exposes no personal-email signal before a reveal, so this filters
   // what has already come back rather than narrowing the search.
-  const [personalOnly, setPersonalOnly] = useState(false);
-  // Apollo returns has_email free on every search result. Narrowing the search
-  // to candidates it holds an address for costs nothing and is the difference
-  // between a pool where nobody is reachable and one where everybody is.
-  const [verifiedEmailOnly, setVerifiedEmailOnly] = useState(true);
-  // Waterfall costs more than a reveal, so it waits for its own confirmation.
-  const [pendingWaterfall, setPendingWaterfall] = useState(null);
-  // Phone reveal is dearer still, so it waits for its own confirmation.
-  const [pendingPhone, setPendingPhone] = useState(null);
-  // Email and phone are separately priced, so a reveal asks for the number only
-  // when the recruiter ticks it - but it can be ticked in the same dialog,
-  // because "reveal the contact details" is one action in a recruiter's head.
-  const [revealWithPhone, setRevealWithPhone] = useState(false);
-  // 'pool' filters candidates; 'person' looks up one the recruiter already
-  // knows. They are separate modes rather than one form doing both, because the
-  // fields mean different things and only one set applies at a time.
-  const [searchMode, setSearchMode] = useState('pool');
-  const [lookup, setLookup] = useState(initialLookup);
-  // Skills held as separate terms rather than one string, because Apollo ANDs
-  // every keyword: three skills routinely narrow a pool to nothing, and the
-  // recruiter needs to turn one off without retyping the rest.
-  const [skills, setSkills] = useState([]);
+  // Every search asks Apollo for candidates whose address it rates verified or
+  // likely to engage. It is not a choice the recruiter has to make: an
+  // unreachable candidate cannot be contacted and cannot be revealed, so the
+  // wider pool was only ever a way to fill the table with dead ends. The
+  // backend still accepts the flag, so widening stays one line away.
+  const verifiedEmailOnly = true;
   // Narrows the rows already on screen. Purely local: it sends nothing to
   // Apollo, so it costs nothing and cannot reach past the loaded page.
   const [rowQuery, setRowQuery] = useState('');
-  // Whether a name search is narrowed by the pool filters as well.
-  //
-  // Both answers are right at different moments: a name on its own finds
-  // everyone who has it - tens of thousands for a common one - while adding the
-  // role, location and skills can narrow it to nobody. So it is the recruiter's
-  // choice rather than a decision baked into the search, and the counts below
-  // say what each one costs.
-  const [nameWithFilters, setNameWithFilters] = useState(true);
-  // Which scope the results on screen actually came from, so the button knows a
-  // re-search is worth offering when only the scope changed.
-  const [appliedNameScope, setAppliedNameScope] = useState(null);
   // What each query actually returned, so the effect of adding a skill is
   // visible instead of guessed. This is only ever appended to by a search the
   // recruiter asked for; nothing here triggers a request.
   const [refineTrail, setRefineTrail] = useState([]);
+  // What Apollo said for each skill on the last search, so the results can say
+  // which skills were asked about and how big each one's pool was.
+  const [lastSkillTotals, setLastSkillTotals] = useState([]);
+  const [matchedAll, setMatchedAll] = useState(false);
+  // Whether the next search asks for every skill or any of them. Off by
+  // default: "any" finds people, "all" is Apollo's AND and finds almost nobody.
+  const [matchAllSkills, setMatchAllSkills] = useState(false);
+  const [rolesOpen, setRolesOpen] = useState(false);
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  const roleFieldRef = useRef(null);
+  const skillFieldRef = useRef(null);
 
   function updateFilter(event) { setFilters({ ...filters, [event.target.name]: event.target.value }); }
-  function updateLookup(event) { setLookup({ ...lookup, [event.target.name]: event.target.value }); }
 
-  // Commits whatever is typed in the keywords box as its own term. Enter and
-  // comma both do it, because a recruiter listing skills types either.
   // Promotes what is typed in the results box into Apollo's own name filter, so
   // the search covers every page instead of the one in hand. It is an explicit
   // action rather than something typing triggers: each one is a real request.
   function searchWholePoolByName() {
     const personName = rowQuery.trim();
-    if (!personName) return;
-    // The same name at the same scope is the search already on screen.
-    if (personName === filters.personName && nameWithFilters === appliedNameScope) return;
+    // The same name is the search already on screen.
+    if (!personName || personName === filters.personName) return;
     setFilters({ ...filters, personName });
-    setAppliedNameScope(nameWithFilters);
     search(1, { personName });
   }
 
   function clearNameFilter() {
     setRowQuery('');
     setFilters({ ...filters, personName: '' });
-    setAppliedNameScope(null);
     search(1, { personName: '' });
   }
 
-  function commitSkill(event) {
-    if (event.key !== 'Enter' && event.key !== ',') return;
-    const term = filters.keywords.trim().replace(/,+$/, '');
-    // Enter with an empty box is a submit, so it is left alone.
-    if (!term) return;
-    event.preventDefault();
-    setFilters({ ...filters, keywords: '' });
-    if (skills.some((skill) => skill.term.toLowerCase() === term.toLowerCase())) return;
-    setSkills([...skills, { term, on: true }]);
+  // One role is the normal case, so a pick replaces the field rather than
+  // adding to it. Several titles still work by typing them with commas, which
+  // Apollo ORs - the picker just does not build that list for you.
+  function chooseRole(role) {
+    setFilters({ ...filters, jobTitle: role });
+    setRolesOpen(false);
   }
 
-  // Turning a term off keeps it to hand: the whole point is to find which skill
-  // narrowed the pool to nothing and drop just that one.
-  function toggleSkill(term) {
-    setSkills(skills.map((skill) => (skill.term === term ? { ...skill, on: !skill.on } : skill)));
+  useEffect(() => {
+    if (!rolesOpen && !skillsOpen) return undefined;
+    const closeOnOutsideClick = (event) => {
+      if (!roleFieldRef.current?.contains(event.target)) setRolesOpen(false);
+      if (!skillFieldRef.current?.contains(event.target)) setSkillsOpen(false);
+    };
+    document.addEventListener('mousedown', closeOnOutsideClick);
+    return () => document.removeEventListener('mousedown', closeOnOutsideClick);
+  }, [rolesOpen, skillsOpen]);
+
+  // Skills do accumulate, unlike the role: a search asks about several of them,
+  // and each one is its own Apollo request.
+  function chooseSkill(skill) {
+    const parts = filters.keywords.split(',');
+    parts[parts.length - 1] = parts.length > 1 ? ` ${skill}` : skill;
+    setFilters({ ...filters, keywords: `${parts.join(',')}, ` });
+    setSkillsOpen(false);
   }
 
-  function removeSkill(term) {
-    setSkills(skills.filter((skill) => skill.term !== term));
-  }
   function resetFilters() {
-    if (searchMode === 'person') return setLookup(initialLookup);
     setFilters(initialFilters);
-    setSkills([]);
     setRefineTrail([]);
   }
 
-  // Switching mode clears the status, which belonged to the other mode's last
-  // request, but leaves any results on screen: they are still Apollo's answer
-  // and the recruiter may still be working through them.
-  function changeMode(mode) {
-    if (mode === searchMode) return;
-    setSearchMode(mode);
-    setStatus(null);
-  }
   function toggle(id) { const next = new Set(selected); next.has(id) ? next.delete(id) : next.add(id); setSelected(next); }
   // Merges in whatever enrichment has come back, then applies the filter.
   // What the box should still narrow locally, which is nothing while it is
@@ -449,10 +479,9 @@ export default function App() {
 
   function shownList() {
     const merged = candidates.map((candidate) => (candidate.id && enriched.get(candidate.id)) || candidate);
-    const filtered = personalOnly ? merged.filter((candidate) => !knownWithoutPersonalEmail(candidate)) : merged;
     // Select all reads this, so a row hidden by the search box is never
     // selected and never quietly paid for.
-    return filtered.filter((candidate) => matchesRowQuery(candidate, localRowQuery()));
+    return merged.filter((candidate) => matchesRowQuery(candidate, localRowQuery()));
   }
 
   // Selects only what is on screen: with the filter on, Select all must not
@@ -483,15 +512,17 @@ export default function App() {
   // search anywhere else behaves.
   function queryFor(overrides = {}) {
     const personName = overrides.personName !== undefined ? overrides.personName : filters.personName;
-    const withFilters = overrides.nameWithFilters !== undefined ? overrides.nameWithFilters : nameWithFilters;
     // The committed terms plus whatever is still in the box, so a skill the
     // recruiter typed but did not press Enter on is not silently dropped.
     if (personName) {
-      return withFilters
-        ? { ...filters, keywords: effectiveKeywords, personName }
-        : { ...initialFilters, personName };
+      // Location is dropped, and only location. Measured against the live API:
+      // a name alone returns tens of thousands of people in unrelated roles,
+      // role and skills narrow that to a handful of real matches, and adding
+      // location takes it to nothing - because Apollo returns no location on a
+      // search row, so a name filtered by one matches almost no record it has.
+      return { ...filters, keywords: filters.keywords, location: '', personName };
     }
-    return { ...filters, ...overrides, keywords: effectiveKeywords, personName: '' };
+    return { ...filters, ...overrides, keywords: filters.keywords, personName: '' };
   }
 
   // `overrides` carries a filter the recruiter changed in the same click.
@@ -503,7 +534,7 @@ export default function App() {
     const keywords = query.keywords;
     const send = () => fetch('/api/candidates/search', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...query, page: nextPage, verifiedEmailOnly })
+      body: JSON.stringify({ ...query, page: nextPage, verifiedEmailOnly, matchAllSkills })
     });
     try {
       let response = await send();
@@ -515,6 +546,8 @@ export default function App() {
       const data = await readJson(response);
       setCandidates(data.candidates); setTotal(data.total); setSelected(new Set());
       setPerPage(data.perPage || DEFAULT_PER_PAGE);
+      setLastSkillTotals(data.skillTotals || []);
+      setMatchedAll(data.matchedAllSkills === true);
       // Recorded so the recruiter can see which term narrowed the pool and by
       // how much, rather than having to remember the last count.
       const total = typeof data.total === 'number' ? data.total : data.candidates.length;
@@ -522,10 +555,15 @@ export default function App() {
       // skill, which a name search does not do. Repeating the same query is not
       // new information either, so an identical entry replaces the last one.
       if (!query.personName) {
+        // Recorded with the filters that distinguish it: the same keywords at a
+        // different seniority or email scope is a different query, and showing
+        // both as bare keywords made the trail read as a contradiction.
+        const entry = { keywords, seniority: query.seniority, total };
         setRefineTrail((previous) => {
           const last = previous[previous.length - 1];
-          if (last && last.keywords === keywords && last.total === total) return previous;
-          return [...previous, { keywords, total }].slice(-REFINE_TRAIL_LENGTH);
+          if (last && last.keywords === entry.keywords && last.seniority === entry.seniority
+            && last.total === entry.total) return previous;
+          return [...previous, entry].slice(-REFINE_TRAIL_LENGTH);
         });
       }
 
@@ -542,9 +580,9 @@ export default function App() {
           // A name search finding nothing has two quite different causes, and
           // pointing at the wrong one sends the recruiter after the wrong fix.
           text: query.personName
-            ? (query.jobTitle || query.location || query.keywords || query.company || query.industry || query.seniority)
-              ? `Nobody named "${query.personName}" matches your ${narrowedBy}. Untick "Also narrow the name search" and search again to see everyone with that name, or widen the filters first.`
-              : `Apollo has nobody by the name "${query.personName}". Nothing else was applied to this search, so try a different spelling, or just the first or last name on its own.`
+            ? nameNarrowedBy
+              ? `Nobody named "${query.personName}" matches your ${nameNarrowedBy}. Clear a filter and search the name again, or try a different spelling.`
+              : `Apollo has nobody by the name "${query.personName}". Try a different spelling, or just the first or last name on its own.`
             : terms.length > 1
               ? `No candidates match all ${terms.length} keywords at once - Apollo requires every one of them. ${lastHit ? `"${lastHit.keywords}" matched ${lastHit.total.toLocaleString()}. ` : ''}Turn a skill off and search again.`
               : 'No matching candidates found.'
@@ -554,51 +592,11 @@ export default function App() {
     finally { setLoading(''); }
   }
 
-  // Looks up one person the recruiter already knows. Apollo's match endpoint is
-  // an enrichment call, so unlike search this never retries by itself: a
-  // dropped connection does not prove Apollo went unasked, and a silent retry
-  // could pay for the same lookup twice.
-  async function lookupPerson(event) {
-    event.preventDefault();
-    if (!canLookup) {
-      return setStatus({ type: 'error', text: 'Enter an email address, a LinkedIn URL, or a name to look one person up.' });
-    }
-    setLoading('lookup'); setStatus(null);
-    try {
-      const data = await readJson(await fetch('/api/candidates/lookup', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(lookup)
-      }));
-      // Apollo having nobody who matches is an answer, not a failure, and it
-      // must not leave the previous person's row on screen as though it were
-      // the result of this lookup.
-      if (!data.candidate) {
-        setCandidates([]); setTotal(0); setSelected(new Set());
-        return setStatus({ type: 'info', text: 'Apollo has no person matching those details. Check the spelling, or try the email address or LinkedIn URL instead.' });
-      }
-
-      const candidate = data.candidate;
-      setCandidates([candidate]); setTotal(1); setPage(1); setPerPage(DEFAULT_PER_PAGE);
-      setSelected(new Set());
-      if (candidate.id) {
-        // A match answers with the full profile, so the row is already enriched
-        // and its details are worth opening. contactRevealed is deliberately
-        // not set: the lookup did not ask Apollo for contact data, so its
-        // silence about a personal address means "never asked", not "none".
-        setEnriched((previous) => new Map(previous).set(candidate.id, candidate));
-        setStates((previous) => markState(previous, [candidate.id], ENRICHED));
-        setExpanded((previous) => new Set([...previous, candidate.id]));
-      }
-      setStatus({ type: 'success', text: `Apollo matched ${candidate.name || 'one person'}. Reveal email to ask Apollo for an address.` });
-    } catch (error) {
-      setStatus({ type: 'error', text: error.message || 'Unable to look that person up.' });
-    } finally { setLoading(''); }
-  }
-
   function submitSearch(event) {
     event.preventDefault();
     // Apollo bills for every search, so refuse one that cannot be meaningful.
     if (!canSearch) {
-      return setStatus({ type: 'error', text: `Role / job title, skills / keywords and location are required. Still needed: ${missingRequired.map((key) => FIELD_LABELS[key]).join(', ')}.` });
+      return setStatus({ type: 'error', text: 'A location is required, along with a role or at least one skill.' });
     }
     // Describing a pool is the opposite question to naming a person, so a live
     // name filter is dropped rather than silently ANDed onto the new search.
@@ -612,7 +610,7 @@ export default function App() {
   // Enrich and reveal post the same body to backend routes that answer in the
   // same shape. They differ in the state a row shows while in flight and, on
   // the backend, in whether Apollo was asked to spend credits on contact data.
-  async function runEnrichment({ path, requested, busyKey, inFlightState, summarize, failureText, restoreOnError = false }) {
+  async function runEnrichment({ path, requested, busyKey, inFlightState, summarize, failureText, restoreOnError = false, notice = '' }) {
     const before = new Map(requested.map((id) => [id, stateOf(states, id)]));
     setStates((previous) => markState(previous, requested, inFlightState));
     setLoading(busyKey); setStatus(null);
@@ -629,7 +627,7 @@ export default function App() {
       // Open what we just enriched: the recruiter asked for this data, so do
       // not make them click again to see it.
       setExpanded((previous) => new Set([...previous, ...outcome.matchedIds]));
-      setStatus({ type: outcome.failed ? 'info' : 'success', text: summarize(outcome) });
+      setStatus({ type: outcome.failed ? 'info' : 'success', text: [notice, summarize(outcome)].filter(Boolean).join(' ') });
     } catch (error) {
       // An exhausted credit balance is not the candidate's failure: nothing was
       // asked of Apollo, so the rows must not be left showing Retry for
@@ -683,39 +681,15 @@ export default function App() {
             : 'Select at least one candidate to reveal contact details for.'
       });
     }
-    setStatus(noAddressOnFile
-      ? { type: 'info', text: `${noAddressOnFile} selected candidate${noAddressOnFile === 1 ? ' has' : 's have'} no email on file at Apollo and ${noAddressOnFile === 1 ? 'was' : 'were'} left out, so no credit is wasted on ${noAddressOnFile === 1 ? 'it' : 'them'}.` }
-      : null);
-    setPendingReveal(requested);
-  }
-
-  // Waterfall asks Apollo to look through third-party data sources for an
-  // address it does not already hold. It is the only path that can beat Apollo's
-  // own coverage, and the only asynchronous one: the addresses arrive minutes
-  // later, so the request is started here and polled for below.
-  function findPersonalEmails(explicitIds) {
-    const ids = explicitIds || [...selected];
-    const asked = idsToReveal(ids, states, enriched, { refresh: true });
-    const withAddress = asked.filter((id) => enriched.get(id)?.personalEmail);
-    // A waterfall that already ran to completion has its answer, and running it
-    // again asks Apollo to pay vendors for the same lookup. So a candidate is
-    // only sent once; a second pass is a deliberate act, not a second click.
-    const eligible = asked
-      .filter((id) => !enriched.get(id)?.personalEmail)
-      .filter((id) => !enriched.get(id)?.waterfallChecked);
-    if (!eligible.length) {
-      const alreadyChecked = asked.length - withAddress.length;
-      return setStatus({
-        type: 'info',
-        text: !ids.length
-          ? 'Select at least one candidate to search other data sources for.'
-          : alreadyChecked
-            ? `Other data sources have already been searched for ${alreadyChecked === 1 ? 'that candidate' : `those ${alreadyChecked} candidates`} and found no personal email, so nothing was sent again and no credit was spent.`
-            : 'Every selected candidate already has a personal email.'
-      });
-    }
-    setStatus(null);
-    setPendingWaterfall(eligible);
+    // Sent on the click that asked for it. The cost is on the button, so a
+    // second click would only have repeated what was already on screen.
+    return runEnrichment({
+      path: '/api/candidates/reveal', requested, busyKey: 'reveal', inFlightState: REVEALING,
+      summarize: revealSummary, failureText: 'Unable to reveal contact details.', restoreOnError: true,
+      notice: noAddressOnFile
+        ? `${noAddressOnFile} selected candidate${noAddressOnFile === 1 ? ' has' : 's have'} no email on file at Apollo and ${noAddressOnFile === 1 ? 'was' : 'were'} left out, so no credit is wasted on ${noAddressOnFile === 1 ? 'it' : 'them'}.`
+        : ''
+    });
   }
 
   // Asks Apollo for phone numbers. The dearest thing this app can spend, so it
@@ -752,27 +726,14 @@ export default function App() {
               : 'Nothing to request.'
       });
     }
-    setStatus(noneOnFile
-      ? { type: 'info', text: `${noneOnFile} selected candidate${noneOnFile === 1 ? ' has' : 's have'} no phone number on file at Apollo and ${noneOnFile === 1 ? 'was' : 'were'} left out, so no credit is wasted on ${noneOnFile === 1 ? 'it' : 'them'}.` }
-      : null);
-    setPendingPhone(eligible);
-  }
-
-  function cancelPhone() {
-    setPendingPhone(null);
-    setStatus({ type: 'info', text: 'Phone reveal cancelled. No Apollo credits were spent.' });
-  }
-
-  async function confirmPhone() {
-    const requested = pendingPhone || [];
-    setPendingPhone(null);
-    if (!requested.length) return;
-    return runPhoneReveal(requested);
+    return runPhoneReveal(eligible.slice(0, PHONE_LIMIT), noneOnFile
+      ? `${noneOnFile} selected candidate${noneOnFile === 1 ? ' has' : 's have'} no phone number on file at Apollo and ${noneOnFile === 1 ? 'was' : 'were'} left out, so no credit is wasted on ${noneOnFile === 1 ? 'it' : 'them'}.`
+      : '');
   }
 
   // Sends the phone request. Separate from the confirmation above so the email
   // reveal can run it as part of the same confirmed action.
-  async function runPhoneReveal(requested) {
+  async function runPhoneReveal(requested, notice = '') {
     if (!requested.length) return;
 
     // A phone reveal does not enrich anybody: it asks one question and answers
@@ -795,8 +756,8 @@ export default function App() {
       }));
       setExpanded((previous) => new Set([...previous, ...immediate.matchedIds]));
 
-      setStatus({ type: 'info', text: `Asking Apollo for ${requested.length} phone number${requested.length === 1 ? '' : 's'}. Numbers arrive here as Apollo returns them.` });
-      await collectPhones(data.requests || [], requested, before);
+      setStatus({ type: 'info', text: [notice, `Asking Apollo for ${requested.length} phone number${requested.length === 1 ? '' : 's'}. Numbers arrive here as Apollo returns them.`].filter(Boolean).join(' ') });
+      await collectPhones(data.requests || [], requested, before, notice);
     } catch (error) {
       setStates((previous) => new Map([...previous, ...before]));
       setStatus({ type: 'error', text: error.message || 'Unable to reveal phone numbers.' });
@@ -805,7 +766,7 @@ export default function App() {
 
   // Polls each outstanding phone job. Polling costs no credits, so the only
   // cost of waiting is time.
-  async function collectPhones(requests, requested, before = new Map()) {
+  async function collectPhones(requests, requested, before = new Map(), notice = '') {
     const deadline = Date.now() + WATERFALL_MAX_WAIT_MS;
     const outstanding = [...requests];
     const baseById = baseCandidateMap();
@@ -840,124 +801,13 @@ export default function App() {
 
     setStates((previous) => new Map([...previous, ...before]));
     if (found) {
-      setStatus({ type: 'success', text: `Found ${found} phone number${found === 1 ? '' : 's'}.` });
+      setStatus({ type: 'success', text: [notice, `Found ${found} phone number${found === 1 ? '' : 's'}.`].filter(Boolean).join(' ') });
     } else if (expired) {
       setStatus({ type: 'error', text: `Apollo could not return ${expired === 1 ? 'the result' : `${expired} of the results`} for this request, so it is unknown whether a number was found. Try again before spending more.` });
     } else if (outstanding.length) {
       setStatus({ type: 'info', text: 'Apollo is still working on this. Numbers were not ready in time; try again shortly.' });
     } else {
       setStatus({ type: 'info', text: 'Apollo holds no phone number for these candidates.' });
-    }
-  }
-
-  function cancelWaterfall() {
-    setPendingWaterfall(null);
-    setStatus({ type: 'info', text: 'Search cancelled. No Apollo credits were spent.' });
-  }
-
-  async function confirmWaterfall() {
-    const requested = pendingWaterfall || [];
-    setPendingWaterfall(null);
-    if (!requested.length) return;
-
-    setStates((previous) => markState(previous, requested, SEARCHING_SOURCES));
-    setLoading('waterfall'); setStatus(null);
-    try {
-      const response = await fetch('/api/candidates/waterfall', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: requested })
-      });
-      const data = await readJson(response);
-
-      // Whatever Apollo already held comes back at once; show it immediately
-      // rather than making the recruiter wait on the slow half.
-      const immediate = reconcile(data.requestedIds || requested, { candidates: data.candidates, skippedIds: data.skippedIds });
-      setEnriched((previous) => applyEnriched(previous, immediate, { contactRevealed: true }));
-      setExpanded((previous) => new Set([...previous, ...immediate.matchedIds]));
-
-      setStatus({ type: 'info', text: `Searching other data sources for ${requested.length} candidate${requested.length === 1 ? '' : 's'}. This takes a few minutes; results appear here as they arrive.` });
-      await collectWaterfall(data.requests || [], requested);
-    } catch (error) {
-      setStates((previous) => markState(previous, requested, ENRICHED));
-      setStatus({ type: 'error', text: error.message || 'Unable to search other data sources.' });
-    } finally { setLoading(''); }
-  }
-
-  // Polls each outstanding request until Apollo answers, it expires, or we give
-  // up. Polling costs no credits, so the only cost of waiting is time.
-  async function collectWaterfall(requests, requested) {
-    const deadline = Date.now() + WATERFALL_MAX_WAIT_MS;
-    const outstanding = [...requests];
-    // What each row already shows, so a waterfall answer - which carries only
-    // the person id and whatever the vendors found - is merged over the record
-    // rather than replacing it with a nameless husk.
-    const baseById = baseCandidateMap();
-    // Only vendors Apollo actually named, so the recruiter can be told which
-    // sources were checked instead of a vague "other data sources".
-    const vendorNames = new Set();
-    let found = 0;
-    // An expired or unrecognised job is not the same as a search that finished
-    // empty, and saying so would hide a fault behind a plausible result.
-    let expired = 0;
-    // Addresses Apollo says it found, and how many never reached us.
-    let charged = 0;
-    let undelivered = 0;
-
-    while (outstanding.length && Date.now() < deadline) {
-      const job = outstanding.shift();
-      let result;
-      try {
-        result = await readJson(await fetch(`/api/candidates/waterfall/${encodeURIComponent(job.requestId)}`));
-      } catch (error) {
-        setStatus({ type: 'error', text: error.message || 'Unable to read the search result.' });
-        break;
-      }
-
-      if (result.status === 'pending') {
-        outstanding.push(job);
-        await new Promise((resolve) => setTimeout(resolve, Math.max(1, Number(result.retryAfterSeconds) || 10) * 1000));
-        continue;
-      }
-      if (result.status === 'ready') {
-        const outcome = reconcile(job.ids, { candidates: result.candidates, skippedIds: [] });
-        // Merged, and every id in this job marked as checked: Apollo answering
-        // with no record for an id is still an answer about that id, which is
-        // the difference between "none found" and "never asked".
-        setEnriched((previous) => applyWaterfall(previous, outcome, { baseById, checkedIds: job.ids }));
-        // Open what the search found: the recruiter paid for it and waited.
-        setExpanded((previous) => new Set([...previous, ...outcome.matchedIds]));
-        found += result.candidates.filter((candidate) => candidate.personalEmail || candidate.emailType === 'personal').length;
-        for (const vendor of result.summary?.vendors || []) {
-          if (vendor?.name) vendorNames.add(vendor.name);
-        }
-        // Apollo counts what it found; the addresses themselves only travel in
-        // the webhook POST. If that delivery failed we have been charged for
-        // addresses we never received, which must not read as "found nothing".
-        charged += Number(result.summary?.emailsFound) || 0;
-        if (result.delivery?.status === 'failed') undelivered += Number(result.summary?.emailsFound) || 0;
-      }
-      if (result.status === 'expired') expired += 1;
-    }
-
-    setStates((previous) => markState(previous, requested, ENRICHED));
-    if (found) {
-      setStatus({ type: 'success', text: `Found ${found} personal email${found === 1 ? '' : 's'} in other data sources.` });
-    } else if (undelivered) {
-      setStatus({
-        type: 'error',
-        text: `Apollo found ${undelivered} address${undelivered === 1 ? '' : 'es'} and charged for ${undelivered === 1 ? 'it' : 'them'}, but could not deliver ${undelivered === 1 ? 'it' : 'them'} to APOLLO_WEBHOOK_URL. Point that setting at an endpoint Apollo can reach - this app serves one at /api/apollo/waterfall-webhook - and run the search again.`
-      });
-    } else if (expired) {
-      setStatus({ type: 'error', text: `Apollo could not return ${expired === 1 ? 'the result' : `${expired} of the results`} for this search, so it is unknown whether an address was found. Try again before spending more.` });
-    } else if (outstanding.length) {
-      setStatus({ type: 'info', text: 'The search is still running at Apollo. Results were not ready in time; try again shortly.' });
-    } else if (charged) {
-      setStatus({ type: 'info', text: `Apollo searched other sources and charged for ${charged} record${charged === 1 ? '' : 's'}, but returned no personal address we could use.` });
-    } else {
-      // A completed search that found nothing is a valid result, not an error:
-      // it is reported as information, and it names only the sources Apollo
-      // said it queried.
-      const checked = vendorNames.size ? ` Sources checked: ${[...vendorNames].join(', ')}.` : '';
-      setStatus({ type: 'info', text: `No personal email found.${checked}` });
     }
   }
 
@@ -978,224 +828,224 @@ export default function App() {
       .filter((id) => (enriched.get(id) || known.get(id))?.hasPhoneOnFile !== false);
   }
 
-  function cancelReveal() {
-    setPendingReveal(null);
-    setStatus({ type: 'info', text: 'Reveal cancelled. No Apollo credits were spent.' });
-  }
-
-  async function confirmReveal() {
-    const requested = pendingReveal || [];
-    const alsoPhone = revealWithPhone;
-    setPendingReveal(null);
-    if (!requested.length) return;
-    await runEnrichment({
-      path: '/api/candidates/reveal', requested, busyKey: 'reveal', inFlightState: REVEALING,
-      summarize: revealSummary, failureText: 'Unable to reveal contact details.', restoreOnError: true
-    });
-    // The number was asked for in the same confirmed action, so it runs without
-    // a second dialog - but still only for the candidates it is worth spending
-    // a mobile credit on.
-    if (!alsoPhone) return;
-    const forPhone = phoneWorthAsking(requested);
-    if (forPhone.length) await runPhoneReveal(forPhone);
-  }
-
   const mergedCandidates = candidates.map((candidate) => (candidate.id && enriched.get(candidate.id)) || candidate);
-  const withPersonal = mergedCandidates.filter(personalEmailOf);
-  const afterPersonalFilter = personalOnly
-    ? mergedCandidates.filter((candidate) => !knownWithoutPersonalEmail(candidate))
-    : mergedCandidates;
-  const visibleCandidates = afterPersonalFilter.filter((candidate) => matchesRowQuery(candidate, localRowQuery()));
-  const hiddenByRowQuery = afterPersonalFilter.length - visibleCandidates.length;
-  // Apollo only reports a personal address once a reveal has run, so these three
-  // counts are genuinely different things: has one, confirmed to have none, and
-  // not yet asked.
-  const hiddenByFilter = mergedCandidates.filter(knownWithoutPersonalEmail).length;
-  // Not yet asked about contact data. Enriched-but-never-revealed counts here:
-  // Apollo has told us nothing about a personal address for those.
-  const unrevealed = mergedCandidates.filter((candidate) => !candidate.contactRevealed).length;
+  const visibleCandidates = mergedCandidates.filter((candidate) => matchesRowQuery(candidate, localRowQuery()));
+  const hiddenByRowQuery = mergedCandidates.length - visibleCandidates.length;
   const totalPages = total !== null && perPage ? Math.max(1, Math.ceil(total / perPage)) : null;
   const searching = loading === 'search';
   // Every enabled term, plus what is still uncommitted in the box. Joined with
   // spaces because that is how Apollo reads them: one pool that matches all of
   // them, not one per term.
-  const activeSkills = skills.filter((skill) => skill.on).map((skill) => skill.term);
-  const effectiveKeywords = [...activeSkills, filters.keywords.trim()].filter(Boolean).join(' ');
-  const missingRequired = REQUIRED_FILTERS
-    .filter((key) => (key === 'keywords' ? effectiveKeywords === '' : filters[key].trim() === ''));
+  const missingRequired = REQUIRED_FILTERS.filter((key) => filters[key].trim() === '');
+  if (REQUIRED_EITHER.every((key) => filters[key].trim() === '')) missingRequired.push('jobTitle');
   const canSearch = missingRequired.length === 0;
-  const lookingUp = loading === 'lookup';
+  // What the two spending buttons would cost right now. Shown on the buttons
+  // themselves, so the figure that used to need a confirmation dialog is
+  // simply on screen.
+  // Only the titles that match what is being typed, and never one already
+  // chosen, so the list shortens as the recruiter narrows instead of staying a
+  // wall of twenty-two.
+  const typedRole = filters.jobTitle.split(',').pop().trim().toLowerCase();
+  // A field holding exactly one of the suggestions means a role was picked, not
+  // typed, so the whole list comes back: filtering it down to the single title
+  // already chosen left no way to browse to a different one.
+  const rolePicked = ROLE_SUGGESTIONS.some((role) => role.toLowerCase() === typedRole);
+  // Skills suggested for the roles actually chosen, in the order the roles were
+  // given, so a search for two roles offers both their skills.
+  const roleSkills = [...new Set(splitList(filters.jobTitle)
+    .flatMap((role) => SKILLS_BY_ROLE[role.trim().toLowerCase()] || []))];
+  const typedSkill = filters.keywords.split(',').pop().trim().toLowerCase();
+  const chosenSkills = splitList(filters.keywords).map((skill) => skill.toLowerCase());
+  const skillMatches = (roleSkills.length ? roleSkills : COMMON_SKILLS)
+    .filter((skill) => !chosenSkills.includes(skill.toLowerCase()))
+    .filter((skill) => !typedSkill || skill.toLowerCase().includes(typedSkill));
+  const roleMatches = ROLE_SUGGESTIONS
+    .filter((role) => !typedRole || rolePicked || role.toLowerCase().includes(typedRole));
+
+  const selectedIds = [...selected];
+  const emailCost = Math.min(idsToReveal(selectedIds, states, enriched).length, REVEAL_LIMIT);
+  const phoneIds = phoneWorthAsking(selectedIds).slice(0, PHONE_LIMIT);
+  const phoneConfirmed = phoneIds.filter((id) => {
+    const known = candidates.find((candidate) => (candidate.requestedId || candidate.id) === id);
+    return (enriched.get(id) || known)?.hasPhoneOnFile === true;
+  }).length;
   // The pool filters that currently hold a value, named for the copy below so
   // it can say what a name search is being narrowed by instead of guessing.
-  const activeFilterLabels = [
-    ['jobTitle', 'role'], ['location', 'location'], ['company', 'company'],
-    ['industry', 'industry'], ['seniority', 'seniority']
-  ].filter(([key]) => filters[key].trim() !== '').map(([, label]) => label);
-  if (effectiveKeywords) activeFilterLabels.push('skills');
+  const activeFilterLabels = [['jobTitle', 'role'], ['location', 'location'], ['seniority', 'seniority']]
+    .filter(([key]) => filters[key].trim() !== '').map(([, label]) => label);
+  if (filters.keywords.trim()) activeFilterLabels.push('skills');
   const narrowedBy = activeFilterLabels.join(', ').replace(/, ([^,]*)$/, ' and $1');
-  // One identifier is enough, and a company alone is not one of them.
-  const canLookup = LOOKUP_IDENTIFIERS.some((key) => lookup[key].trim() !== '');
-  const resultsSummary = searchMode === 'person'
-    // One matched person is not a page of a pool, so it is not counted as one.
-    ? (candidates.length ? 'The person Apollo matched' : 'No person matched yet')
-    : candidates.length
-      ? (total !== null
-        ? `Showing ${candidates.length} of ${total.toLocaleString()} profiles`
+  // A name search never applies location, so the copy must not claim it does.
+  const nameNarrowedBy = activeFilterLabels.filter((label) => label !== 'location')
+    .join(', ').replace(/, ([^,]*)$/, ' and $1');
+  const skillTotals = lastSkillTotals;
+  const resultsSummary = candidates.length
+    ? (total !== null
+      ? `Showing ${candidates.length} of ${total.toLocaleString()} profiles`
+      // A union of several skill searches has no single total Apollo can give,
+      // so the per-skill counts are shown instead of an invented number.
+      : skillTotals.length > 1
+        ? `${candidates.length} candidates matching any of ${skillTotals.length} skills`
         : `Showing ${candidates.length} profiles`)
-      : 'Profiles returned by Apollo';
+    : 'Profiles returned by Apollo';
 
   return <main>
     <header className="topbar"><div className="mark">A<span>/</span></div><div><p className="eyebrow">Talent intelligence</p><h1>Candidate Search</h1></div><div className="secure"><span className="dot" /> Apollo connected via secure backend</div></header>
 
-    <form className="panel search-panel" onSubmit={searchMode === 'person' ? lookupPerson : submitSearch}>
+    <form className="panel search-panel" onSubmit={submitSearch}>
       {/* No heading or blurb: the field labels already carry Required, so the
           copy was repeating itself. Reset keeps its place. */}
       <div className="panel-heading heading-bare">
         <button type="button" className="link-button" onClick={resetFilters}>
-          {searchMode === 'person' ? 'Reset details' : 'Reset filters'}
+          Reset filters
         </button>
       </div>
 
-      {/* Two ways in, one at a time: filter a pool, or match one person the
-          recruiter already knows. */}
-      <div className="mode-switch" role="radiogroup" aria-label="Search mode">
-        {[['pool', 'Filter a pool'], ['person', 'Find one person']].map(([mode, label]) => <button
-          key={mode}
-          type="button"
-          role="radio"
-          aria-checked={searchMode === mode}
-          className={searchMode === mode ? 'mode-option is-on' : 'mode-option'}
-          onClick={() => changeMode(mode)}
-        >{label}</button>)}
-      </div>
-
-      {searchMode === 'pool' ? <>
-        <div className="form-grid">
-          {fields.map(([name, label, placeholder, required]) => <label key={name}>
+      <div className="form-grid">
+          {fields.map(([name, label, placeholder, required]) => <label
+            key={name}
+            ref={name === 'jobTitle' ? roleFieldRef : name === 'keywords' ? skillFieldRef : undefined}
+          >
             {label}{required && <em className="req" aria-hidden="true">Required</em>}
             <input
               name={name}
               value={filters[name]}
               onChange={updateFilter}
-              // Enter or comma turns a typed skill into a term of its own. Only
-              // the keywords box does this; the others are single values.
-              onKeyDown={name === 'keywords' ? commitSkill : undefined}
-              placeholder={name === 'keywords' ? 'e.g. Java, then Enter for each skill' : placeholder}
-              // The keyword requirement can be met by a committed term instead
-              // of by text in the box, so the native attribute is dropped only
-              // once a term actually satisfies it. Otherwise the browser would
-              // refuse to submit a form that is genuinely complete.
-              required={required && (name !== 'keywords' || activeSkills.length === 0)}
+              placeholder={placeholder}
+              required={required}
               aria-required={required}
+              autoComplete="off"
+              onFocus={name === 'jobTitle' ? () => setRolesOpen(true)
+                : name === 'keywords' ? () => setSkillsOpen(true) : undefined}
+              onKeyDown={(event) => {
+                if (event.key !== 'Escape') return;
+                if (name === 'jobTitle') setRolesOpen(false);
+                if (name === 'keywords') setSkillsOpen(false);
+              }}
+              role={name === 'jobTitle' || name === 'keywords' ? 'combobox' : undefined}
+              aria-expanded={name === 'jobTitle' ? rolesOpen : name === 'keywords' ? skillsOpen : undefined}
+              aria-controls={name === 'jobTitle' ? 'role-suggestions' : name === 'keywords' ? 'skill-suggestions' : undefined}
             />
+            {name === 'keywords' && <>
+              <button
+                type="button"
+                className="role-toggle"
+                aria-label={skillsOpen ? 'Hide suggested skills' : 'Show suggested skills'}
+                aria-expanded={skillsOpen}
+                onClick={() => setSkillsOpen(!skillsOpen)}
+              >&#9662;</button>
+              {skillsOpen && skillMatches.length > 0 && <ul className="role-list" id="skill-suggestions" role="listbox">
+                {roleSkills.length > 0 && <li className="role-list-note">
+                  Suggested for {splitList(filters.jobTitle).join(' and ')}
+                </li>}
+                {skillMatches.map((skill) => <li key={skill}>
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected="false"
+                    onMouseDown={(event) => { event.preventDefault(); chooseSkill(skill); }}
+                  >{skill}</button>
+                </li>)}
+              </ul>}
+            </>}
+            {name === 'jobTitle' && <>
+              <button
+                type="button"
+                className="role-toggle"
+                aria-label={rolesOpen ? 'Hide suggested roles' : 'Show suggested roles'}
+                aria-expanded={rolesOpen}
+                onClick={() => setRolesOpen(!rolesOpen)}
+              >&#9662;</button>
+              {rolesOpen && roleMatches.length > 0 && <ul className="role-list" id="role-suggestions" role="listbox">
+                {roleMatches.map((role) => <li key={role}>
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected="false"
+                    // Chosen on mousedown: a click would blur the field and
+                    // close the list before the selection landed.
+                    onMouseDown={(event) => { event.preventDefault(); chooseRole(role); }}
+                  >{role}</button>
+                </li>)}
+              </ul>}
+            </>}
           </label>)}
-          <label>Seniority<select name="seniority" value={filters.seniority} onChange={updateFilter}><option value="">Any level</option><option value="entry">Entry</option><option value="junior">Junior</option><option value="mid_level">Mid-level</option><option value="senior">Senior</option><option value="manager">Manager</option><option value="director">Director</option></select></label>
+          <label>Seniority<select name="seniority" value={filters.seniority} onChange={updateFilter}>
+            <option value="">Any level</option>
+            {SENIORITIES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </select></label>
         </div>
         {/* Apollo requires every keyword to match, so each term is held
             separately and can be turned off without retyping the others. */}
-        <div className="skill-terms">
-          <span className="skill-terms-label">Skills Apollo must match</span>
-          {/* Present even when empty. Held back until the first term existed,
-              the whole feature was invisible and nobody found it. */}
-          {skills.length === 0 && <p className="hint">
-            None yet. Type a skill in Skills / Keywords and press Enter to add it as its own term - Apollo returns only candidates matching every one, so adding them separately is what lets you drop the one that narrows the pool too far.
-          </p>}
-          <ul className="chips chips-editable">
-            {skills.map((skill) => <li key={skill.term} className={skill.on ? 'chip-on' : 'chip-off'}>
-              <button
-                type="button"
-                className="chip-toggle"
-                aria-pressed={skill.on}
-                onClick={() => toggleSkill(skill.term)}
-              >{skill.term}</button>
-              <button
-                type="button"
-                className="chip-remove"
-                aria-label={`Remove ${skill.term}`}
-                onClick={() => removeSkill(skill.term)}
-              >&times;</button>
-            </li>)}
-          </ul>
-          {skills.length > 0 && <p className="hint">
-            {activeSkills.length > 1
-              ? `Apollo will return only candidates matching all ${activeSkills.length}: ${activeSkills.join(' + ')}.`
-              : 'Add another skill to narrow the pool, or turn one off to widen it.'}
-          </p>}
-        </div>
+        {splitList(filters.keywords).length > 1 && <label className="filter-toggle skills-mode">
+          <input
+            type="checkbox"
+            checked={matchAllSkills}
+            onChange={() => setMatchAllSkills(!matchAllSkills)}
+          />
+          Candidate must have every skill, not just one
+        </label>}
 
         {/* What each query actually returned. Nothing here sends a request; it
             is the record of searches already run. */}
         {refineTrail.length > 1 && <div className="refine-trail">
-          <span className="skill-terms-label">Pool size as you narrowed</span>
+          <span className="trail-label">Pool size as you narrowed</span>
           <ol>
             {refineTrail.map((entry, index) => <li key={`${entry.keywords}-${index}`} className={entry.total ? '' : 'is-empty'}>
-              <b>{entry.total.toLocaleString()}</b> <span>{entry.keywords || 'no skills'}</span>
+              <b>{entry.total.toLocaleString()}</b> <span>{entry.keywords || 'no skills'}</span>{' '}
+              {entry.seniority && <em>{entry.seniority}</em>}
             </li>)}
           </ol>
         </div>}
 
-        <label className="filter-toggle search-scope">
-          <input type="checkbox" checked={verifiedEmailOnly} onChange={() => setVerifiedEmailOnly(!verifiedEmailOnly)} />
-          Only candidates Apollo has an email for
-        </label>
         <button type="submit" className="primary" disabled={searching || !canSearch}>{searching ? 'Searching candidates...' : 'Search Candidates'} <span>→</span></button>
-        {!canSearch && <p className="hint">Still needed: {missingRequired.map((key) => FIELD_LABELS[key]).join(', ')}.</p>}
-      </> : <>
-        <div className="form-grid">
-          {lookupFields.map(([name, label, placeholder]) => <label key={name}>
-            {label}
-            <input
-              name={name}
-              value={lookup[name]}
-              onChange={updateLookup}
-              placeholder={placeholder}
-              type={name === 'email' ? 'email' : 'text'}
-              inputMode={name === 'email' ? 'email' : undefined}
-            />
-          </label>)}
-        </div>
-        <button type="submit" className="primary" disabled={lookingUp || !canLookup}>{lookingUp ? 'Looking this person up...' : 'Find this person'} <span>→</span></button>
-        {/* The cost is stated where the click happens. A lookup is one person,
-            so it is capped by Apollo's endpoint rather than by a confirmation
-            step, and it never asks for contact data. */}
-        <p className="hint">
-          {canLookup
-            ? 'Asks Apollo to match one person and may spend one enrichment credit. It does not ask for a personal email or a phone number - reveal those separately once the person is on screen.'
-            : 'Give at least one of name, email address or LinkedIn URL. A company on its own is not a person.'}
-        </p>
-      </>}
+        {!canSearch && <p className="hint">A location is required, along with a role or at least one skill.</p>}
     </form>
 
     {(status || searching || candidates.length > 0) && <section className="results">
       <div className="results-head">
         <div><span className="step">02</span><div><h3>Candidate results</h3><p>{resultsSummary}</p></div></div>
         <div className="selection-actions">
-          <label className="filter-toggle">
-            <input
-              type="checkbox"
-              checked={personalOnly}
-              onChange={() => setPersonalOnly(!personalOnly)}
-              disabled={!candidates.length}
-            />
-            Personal email only ({withPersonal.length})
-          </label>
           <span>Selected: <b>{selected.size}</b></span>
           <button type="button" onClick={selectAll} disabled={!candidates.length}>Select all</button>
           <button type="button" onClick={clearSelection} disabled={!selected.size}>Clear</button>
-          <button type="button" className="reveal" onClick={() => findPersonalEmails()} disabled={!selected.size || Boolean(loading)}>
-            {loading === 'waterfall' ? 'Searching other sources...' : 'Find personal emails'}
-          </button>
           <button type="button" className="reveal" onClick={() => reveal()} disabled={!selected.size || Boolean(loading)}>
-            {loading === 'reveal' ? 'Revealing email...' : `Reveal email${selected.size ? ` (${selected.size})` : ''}`}
+            {loading === 'reveal'
+              ? 'Revealing email...'
+              : `Reveal email${emailCost ? ` - ${emailCost} credit${emailCost === 1 ? '' : 's'}` : ''}`}
           </button>
           <button type="button" className="reveal" onClick={() => revealPhones()} disabled={!selected.size || Boolean(loading)}>
-            {loading === 'phone' ? 'Revealing phone...' : `Reveal phone${selected.size ? ` (${selected.size})` : ''}`}
+            {loading === 'phone'
+              ? 'Revealing phone...'
+              : `Reveal phone${phoneIds.length ? ` - ${phoneIds.length} mobile credit${phoneIds.length === 1 ? '' : 's'}` : ''}`}
           </button>
           <button type="button" className="secondary" onClick={() => enrich()} disabled={!selected.size || Boolean(loading)}>
             {loading === 'enrich' ? 'Enriching selected candidates...' : `Enrich selected${selected.size ? ` (${selected.size})` : ''}`} <span>↗</span>
           </button>
         </div>
       </div>
+
+      {matchedAll && <p className="hint spend-note">
+        Every skill was required at once, so each of these candidates has all of{' '}
+        <b>{skillTotals[0]?.skill}</b>. Untick the box above to see candidates who
+        have any one of them instead.
+      </p>}
+
+      {!matchedAll && skillTotals.length > 1 && <p className="hint spend-note">
+        Each skill was searched separately and the answers merged, so a candidate
+        needs only one of them. Apollo held{' '}
+        {skillTotals.map((entry, index) => <span key={entry.skill}>
+          {index > 0 ? ', ' : ''}<b>{(entry.total || 0).toLocaleString()}</b> for {entry.skill}
+        </span>)}.
+      </p>}
+
+      {/* The one thing a price cannot say: whether Apollo has actually
+          committed to holding a number for these people. */}
+      {phoneIds.length > 0 && <p className="hint spend-note">
+        {phoneConfirmed
+          ? `Apollo confirms a direct number for ${phoneConfirmed} of the ${phoneIds.length} selected. Mobile credits cost more than an email.`
+          : `Apollo has not confirmed it holds a number for ${phoneIds.length === 1 ? 'the selected candidate' : 'any of the selected candidates'} - revealing may return nothing. Mobile credits cost more than an email.`}
+      </p>}
 
       {(candidates.length > 0 || filters.personName) && <div className="row-search">
         <label>
@@ -1207,148 +1057,36 @@ export default function App() {
             // Enter runs the same whole-pool search as the button, because that
             // is what pressing Enter in a search box is expected to do.
             onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); searchWholePoolByName(); } }}
-            placeholder="Name, company, job title or address"
+            placeholder={searching && rowQuery.trim() === filters.personName
+              ? 'Searching Apollo...'
+              : 'Candidate name - press Enter to search all of Apollo'}
           />
-        </label>
-        {/* Both scopes are legitimate, so the choice is stated before the
-            search rather than decided for the recruiter. */}
-        {activeFilterLabels.length > 0 && <label className="filter-toggle name-scope">
-          <input
-            type="checkbox"
-            checked={nameWithFilters}
-            onChange={() => setNameWithFilters(!nameWithFilters)}
-            disabled={searching}
-          />
-          Also narrow the name search by {narrowedBy}
-        </label>}
-
-        <div className="row-search-actions">
-          <button
-            type="button"
-            className="reveal"
-            onClick={searchWholePoolByName}
-            disabled={searching || rowQuery.trim() === ''
-              || (rowQuery.trim() === filters.personName && nameWithFilters === appliedNameScope)}
-          >
-            {searching && rowQuery.trim() === filters.personName
-              ? 'Searching Apollo by name...'
-              : nameWithFilters && activeFilterLabels.length
-                ? `Search by name within ${narrowedBy}`
-                : 'Search all of Apollo by name'}
-          </button>
           {filters.personName && <button type="button" className="link-button" onClick={clearNameFilter} disabled={searching}>
-            Clear name filter
+            Clear name
           </button>}
-        </div>
+        </label>
 
         {filters.personName && <p className="hint">
-          <strong>
-            {appliedNameScope && narrowedBy
-              ? `Showing people named "${filters.personName}" who also match your ${narrowedBy}.`
-              : `Showing everyone in Apollo named "${filters.personName}".`}
-          </strong>{' '}
-          {total !== null ? `${total.toLocaleString()} profile${total === 1 ? '' : 's'} match. ` : ''}
-          {appliedNameScope && narrowedBy
-            ? 'Untick the box above and search again to see everyone with that name.'
-            : narrowedBy
-              ? `Your ${narrowedBy} filters are not applied. Tick the box above and search again to narrow it.`
-              : ''}
+          <strong>Named "{filters.personName}"</strong>
+          {nameNarrowedBy ? `, matching your ${nameNarrowedBy}` : ' , anywhere in Apollo'}
+          {total !== null ? ` - ${total.toLocaleString()} profile${total === 1 ? '' : 's'}.` : '.'}
+          {filters.location.trim() ? ' Location is not applied to a name search.' : ''}
         </p>}
 
         {rowQuery.trim() !== '' && rowQuery.trim() !== filters.personName && <p className="hint">
           {visibleCandidates.length
-            ? `${visibleCandidates.length} of ${afterPersonalFilter.length} loaded row${afterPersonalFilter.length === 1 ? '' : 's'} on this page match.`
-            : `Nothing on this page matches "${rowQuery.trim()}".`}
-          {' '}{nameWithFilters && narrowedBy
-            ? `Searching by name looks through all of Apollo for that name, narrowed by your ${narrowedBy}.`
-            : 'Searching by name looks through all of Apollo for that name, ignoring every other filter.'}
+            ? `${visibleCandidates.length} of ${mergedCandidates.length} name${mergedCandidates.length === 1 ? '' : 's'} on this page match.`
+            : `No name on this page matches "${rowQuery.trim()}".`}
+          {' '}{nameNarrowedBy
+            ? `Press Enter to search all of Apollo for that name, narrowed by your ${nameNarrowedBy}.`
+            : 'Press Enter to search all of Apollo for that name.'}
           {hiddenByRowQuery > 0 ? ' Hidden rows are never selected by Select all.' : ''}
         </p>}
-      </div>}
-
-      {pendingWaterfall && <div className="notice confirm" role="alertdialog" aria-label="Confirm searching other data sources">
-        <p>
-          <strong>This searches other data sources and spends Apollo credits.</strong>{' '}
-          {`Looking for a personal email for ${pendingWaterfall.length} candidate${pendingWaterfall.length === 1 ? '' : 's'}. Apollo charges per address it finds, and results take a few minutes to arrive.`}
-        </p>
-        <div className="confirm-actions">
-          <button type="button" className="reveal" onClick={confirmWaterfall}>
-            {`Search other sources for ${pendingWaterfall.length} candidate${pendingWaterfall.length === 1 ? '' : 's'}`}
-          </button>
-          <button type="button" className="link-button" onClick={cancelWaterfall}>Cancel</button>
-        </div>
-      </div>}
-
-      {pendingPhone && <div className="notice confirm" role="alertdialog" aria-label="Confirm phone number reveal">
-        <p>
-          <strong>This spends Apollo mobile credits, which cost more than an email.</strong>{' '}
-          {pendingPhone.length > PHONE_LIMIT
-            ? `${pendingPhone.length} candidates are selected. Apollo will be asked for the first ${PHONE_LIMIT}; the remaining ${pendingPhone.length - PHONE_LIMIT} are left for a second batch.`
-            : `Asking Apollo for a phone number for ${pendingPhone.length} candidate${pendingPhone.length === 1 ? '' : 's'}.`}{' '}
-          {(() => {
-            // Apollo's free has_direct_phone signal, so the recruiter knows how
-            // many of these it has already said yes to before paying.
-            const known = new Map(mergedCandidates.map((candidate) => [candidate.requestedId || candidate.id, candidate]));
-            const confirmed = pendingPhone.filter((id) => known.get(id)?.hasPhoneOnFile === true).length;
-            return confirmed
-              ? `Apollo says it holds a direct number for ${confirmed} of them. `
-              : 'Apollo has not confirmed in advance that it holds a number for any of them. ';
-          })()}
-          Apollo returns numbers asynchronously, so they arrive here a little after the request.
-        </p>
-        <div className="confirm-actions">
-          <button type="button" className="reveal" onClick={confirmPhone}>
-            {`Reveal ${Math.min(pendingPhone.length, PHONE_LIMIT)} phone number${Math.min(pendingPhone.length, PHONE_LIMIT) === 1 ? '' : 's'}`}
-          </button>
-          <button type="button" className="link-button" onClick={cancelPhone}>Cancel</button>
-        </div>
-      </div>}
-
-      {pendingReveal && <div className="notice confirm" role="alertdialog" aria-label="Confirm Apollo credit spend">
-        <p>
-          <strong>This spends Apollo credits.</strong>{' '}
-          {pendingReveal.length > REVEAL_LIMIT
-            ? `${pendingReveal.length} candidates are selected. Apollo will be asked for the first ${REVEAL_LIMIT}, costing up to ${REVEAL_LIMIT} credits. The remaining ${pendingReveal.length - REVEAL_LIMIT} are left for a second batch.`
-            : `Revealing contact details for ${pendingReveal.length} candidate${pendingReveal.length === 1 ? '' : 's'} costs up to ${pendingReveal.length} credit${pendingReveal.length === 1 ? '' : 's'}.`}
-        </p>
-        {/* Email and phone are priced separately at Apollo, so the number is
-            opt-in - but it is offered here, because "reveal the contact
-            details" is one action to a recruiter and hunting for a second
-            button is how the phone got missed. */}
-        {(() => {
-          const forPhone = phoneWorthAsking(pendingReveal);
-          const confirmed = forPhone.filter((id) => {
-            const known = new Map(mergedCandidates.map((candidate) => [candidate.requestedId || candidate.id, candidate]));
-            return known.get(id)?.hasPhoneOnFile === true;
-          }).length;
-          if (!forPhone.length) {
-            return <p className="hint">This asks for email addresses only. Apollo holds no phone number to ask for on {pendingReveal.length === 1 ? 'this candidate' : 'these candidates'}.</p>;
-          }
-          return <label className="filter-toggle name-scope">
-            <input type="checkbox" checked={revealWithPhone} onChange={() => setRevealWithPhone(!revealWithPhone)} />
-            Also ask for a phone number for {forPhone.length} of {pendingReveal.length}
-            {confirmed ? ` (Apollo confirms a direct number for ${confirmed})` : ''} - extra mobile credits, which cost more than an email
-          </label>;
-        })()}
-
-        <div className="confirm-actions">
-          <button type="button" className="reveal" onClick={confirmReveal}>
-            {`Spend up to ${Math.min(pendingReveal.length, REVEAL_LIMIT)} credit${Math.min(pendingReveal.length, REVEAL_LIMIT) === 1 ? '' : 's'}`}
-            {revealWithPhone ? ' plus mobile' : ''}
-          </button>
-          <button type="button" className="link-button" onClick={cancelReveal}>Cancel</button>
-        </div>
       </div>}
 
       {status && <div className={`notice ${status.type}`} role="status" aria-live="polite">{status.text}</div>}
 
       {searching && !candidates.length && <SkeletonRows />}
-
-      {personalOnly && <p className="hint">
-        {`${withPersonal.length} candidate${withPersonal.length === 1 ? ' has' : 's have'} a personal email.`}
-        {hiddenByFilter > 0 && ` ${hiddenByFilter} hidden - Apollo returned no personal address for ${hiddenByFilter === 1 ? 'that one' : 'those'}.`}
-        {unrevealed > 0 && ` ${unrevealed} not checked yet - revealing asks Apollo whether it holds a personal address, it does not mean one exists.`}
-      </p>}
 
       {candidates.length > 0 && visibleCandidates.length > 0 && <div className="table">
         <div className="table-head"><span /><span>Candidate</span><span>Company</span><span>Location</span><span>Contact</span><span>Enriched</span></div>
@@ -1371,7 +1109,7 @@ export default function App() {
         })}
       </div>}
 
-      {searchMode === 'pool' && candidates.length > 0 && <div className="pagination">
+      {candidates.length > 0 && <div className="pagination">
         <button type="button" onClick={() => search(page - 1)} disabled={page <= 1 || searching}>← Previous</button>
         <span>Page <b>{page}</b>{totalPages ? ` of ${totalPages.toLocaleString()}` : ''}</span>
         <button type="button" onClick={() => search(page + 1)} disabled={searching || (totalPages ? page >= totalPages : candidates.length === 0)}>Next →</button>
