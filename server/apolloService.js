@@ -294,7 +294,14 @@ function searchBody(filters, page, perPage, verifiedEmailOnly) {
   if (filters.personName) body.q_person_name = filters.personName;
   const titles = splitList(filters.jobTitle);
   if (titles.length) body.person_titles = titles;
-  if (filters.location) body.person_locations = [filters.location];
+  // person_locations is an OR at Apollo, like person_titles: listing several
+  // widens the pool rather than narrowing it. Measured for one job title,
+  // Hyderabad alone returned 444 and Hyderabad, Bangalore and Pune together
+  // returned 1,971. Only what the recruiter actually typed is sent - a city is
+  // never expanded into its neighbours or a radius, which Apollo has no way to
+  // express anyway.
+  const locations = splitList(filters.location);
+  if (locations.length) body.person_locations = locations;
   if (filters.seniority) body.person_seniorities = [filters.seniority];
   // organization_names is accepted but does nothing: measured against the live
   // API, a real company, another real company and a nonsense string all

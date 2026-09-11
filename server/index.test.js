@@ -873,3 +873,64 @@ test('matchAllSkills is off unless it is asked for', async () => {
     }
   });
 });
+
+test('one location produces one person_locations value', async () => {
+  await withServer(() => ok({ people: [], total_entries: 444 }), async ({ post, apolloCalls }) => {
+    await post('/api/candidates/search', { jobTitle: 'Frontend Developer', location: 'Hyderabad' });
+    assert.deepEqual(apolloCalls[0].body.person_locations, ['Hyderabad']);
+  });
+});
+
+test('several locations are sent as an OR, not narrowed together', async () => {
+  // person_locations is an OR at Apollo, like person_titles: measured for one
+  // title, Hyderabad alone returned 444 and Hyderabad, Bangalore and Pune
+  // together returned 1,971. Sending them as one string would have asked for a
+  // single place called "Hyderabad, Bangalore, Pune" instead.
+  await withServer(() => ok({ people: [], total_entries: 1971 }), async ({ post, apolloCalls }) => {
+    await post('/api/candidates/search', {
+      jobTitle: 'Frontend Developer', location: 'Hyderabad, Bangalore, Pune'
+    });
+    assert.deepEqual(apolloCalls[0].body.person_locations, ['Hyderabad', 'Bangalore', 'Pune']);
+    // Exactly what was asked for: no city is expanded into its neighbours, and
+    // no radius is added - Apollo has no way to express one.
+    assert.equal(apolloCalls[0].body.person_locations.length, 3);
+  });
+});
+
+test('locations are trimmed and de-duplicated, and empties are dropped', async () => {
+  await withServer(() => ok({ people: [] }), async ({ post, apolloCalls }) => {
+    await post('/api/candidates/search', {
+      jobTitle: 'Frontend Developer', location: ' Hyderabad ,, Bangalore,Hyderabad , '
+    });
+    assert.deepEqual(apolloCalls[0].body.person_locations, ['Hyderabad', 'Bangalore']);
+  });
+});
+
+test('a location that itself contains a country still works', async () => {
+  // "Hyderabad, India" is one location to a recruiter but two comma-separated
+  // values here. Apollo returned the identical count for "Hyderabad" and
+  // "Hyderabad, India", and both parts resolve, so the OR is harmless.
+  await withServer(() => ok({ people: [] }), async ({ post, apolloCalls }) => {
+    await post('/api/candidates/search', { jobTitle: 'Frontend Developer', location: 'Telangana' });
+    assert.deepEqual(apolloCalls[0].body.person_locations, ['Telangana']);
+  });
+});
+
+test('no location at all sends no person_locations', async () => {
+  await withServer(() => ok({ people: [] }), async ({ post, apolloCalls }) => {
+    // A name search is the one query that needs no location.
+    await post('/api/candidates/search', { personName: 'Aditya' });
+    assert.equal('person_locations' in apolloCalls[0].body, false);
+  });
+});
+
+test('a location list of only separators is still no location', async () => {
+  await withServer(() => ok({ people: [] }), async ({ post, apolloCalls }) => {
+    const { status, body } = await post('/api/candidates/search', {
+      jobTitle: 'Frontend Developer', location: ' , , '
+    });
+    assert.equal(status, 400);
+    assert.deepEqual(body.missing, ['location']);
+    assert.equal(apolloCalls.length, 0);
+  });
+});

@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { enrichPeople, matchPerson, normalizeWaterfallCandidate, pollWaterfallResult, requestPhoneNumbers, requestWaterfallEmails, searchPeople } from './apolloService.js';
+import { enrichPeople, matchPerson, normalizeWaterfallCandidate, pollWaterfallResult, requestPhoneNumbers, requestWaterfallEmails, searchPeople, splitList } from './apolloService.js';
 
 // Credit guard: the most people one /enrich call will forward to Apollo.
 // Anything beyond this is reported back as skipped, never silently dropped.
@@ -118,9 +118,10 @@ function publicError(error) {
 
 app.post('/api/candidates/search', async (request, response) => {
   const filters = Object.fromEntries(['jobTitle', 'location', 'seniority', 'keywords', 'company', 'industry', 'personName']
-    // Role and skills are comma-separated lists, so they need more room than a
-    // single value; the rest keep the original bound.
-    .map((key) => [key, clean(request.body?.[key], key === 'jobTitle' || key === 'keywords' ? 400 : 160)]));
+    // Role, skills and location are comma-separated lists, so they need more
+    // room than a single value; the rest keep the original bound.
+    .map((key) => [key, clean(request.body?.[key],
+      ['jobTitle', 'keywords', 'location'].includes(key) ? 400 : 160)]));
   const page = Math.max(1, Math.min(1000, Number.parseInt(request.body?.page, 10) || 1));
   // Costs nothing and keeps credits off candidates Apollo holds no address for.
   // Defaults on: the caller must opt out deliberately.
@@ -136,7 +137,11 @@ app.post('/api/candidates/search', async (request, response) => {
   // A name is exempt: looking a person up by name is a meaningful search in its
   // own right, and demanding a role and a location alongside it is what made a
   // name search return nothing. Apollo's q_person_name works on its own.
-  const missing = filters.personName ? [] : REQUIRED_FILTERS.filter((key) => filters[key] === '');
+  // Counted as a list, not as text: " , , " is punctuation, not a location, and
+  // it used to satisfy the requirement while sending Apollo nothing.
+  const missing = filters.personName
+    ? []
+    : REQUIRED_FILTERS.filter((key) => (key === 'location' ? splitList(filters[key]).length === 0 : filters[key] === ''));
   // A location on its own describes a city, not a search.
   if (!filters.personName && REQUIRED_EITHER.every((key) => filters[key] === '')) missing.push(...REQUIRED_EITHER);
   if (missing.length) {

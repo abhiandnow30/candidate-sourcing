@@ -16,14 +16,19 @@ const initialFilters = { jobTitle: '', location: '', seniority: '', keywords: ''
 // forced the most destructive filter onto every search.
 const REQUIRED_FILTERS = ['location'];
 const REQUIRED_EITHER = ['jobTitle', 'keywords'];
+// Fields holding a comma-separated list, shown as removable chips so the search
+// reads as a list rather than as punctuation.
+const MULTI_VALUE_FIELDS = ['keywords', 'location'];
 
-// Commas, not spaces: "Machine Learning" is one skill.
+// Commas, not spaces: "Machine Learning" is one skill. De-duplicated to match
+// what the server sends Apollo, so a value typed twice is one filter and not
+// two identical chips fighting over the same React key.
 function splitList(value) {
-  return value.split(',').map((item) => item.trim()).filter(Boolean);
+  return [...new Set(value.split(',').map((item) => item.trim()).filter(Boolean))];
 }
 const fields = [
   ['jobTitle', 'Role / Job Title', 'e.g. Data Scientist', false],
-  ['location', 'Location', 'e.g. Hyderabad', true],
+  ['location', 'Location', 'e.g. Hyderabad, Bangalore, Pune', true],
   ['keywords', 'Skills', 'e.g. Python, LLM, Machine Learning', false],
 ];
 
@@ -458,6 +463,16 @@ export default function App() {
     setSkillsOpen(false);
   }
 
+  // Drops one location and leaves the others alone. Locations are held as the
+  // text the recruiter typed, so this rewrites that text rather than a list.
+  // Drops one value from a comma-separated field and leaves the rest alone.
+  // Both multi-value fields are held as the text the recruiter typed, so this
+  // rewrites that text rather than a list.
+  function removeValue(field, value) {
+    const kept = splitList(filters[field]).filter((entry) => entry !== value);
+    setFilters({ ...filters, [field]: kept.join(', ') });
+  }
+
   function resetFilters() {
     setFilters(initialFilters);
     setRefineTrail([]);
@@ -836,7 +851,9 @@ export default function App() {
   // Every enabled term, plus what is still uncommitted in the box. Joined with
   // spaces because that is how Apollo reads them: one pool that matches all of
   // them, not one per term.
-  const missingRequired = REQUIRED_FILTERS.filter((key) => filters[key].trim() === '');
+  const locations = splitList(filters.location);
+  const missingRequired = REQUIRED_FILTERS
+    .filter((key) => (key === 'location' ? locations.length === 0 : filters[key].trim() === ''));
   if (REQUIRED_EITHER.every((key) => filters[key].trim() === '')) missingRequired.push('jobTitle');
   const canSearch = missingRequired.length === 0;
   // What the two spending buttons would cost right now. Shown on the buttons
@@ -890,7 +907,12 @@ export default function App() {
     : 'Profiles returned by Apollo';
 
   return <main>
-    <header className="topbar"><div className="mark">A<span>/</span></div><div><p className="eyebrow">Talent intelligence</p><h1>Candidate Search</h1></div><div className="secure"><span className="dot" /> Apollo connected via secure backend</div></header>
+    <header className="topbar">
+      {/* Swap the logo by replacing public/neutara-logo.svg — no code change. */}
+      <img className="mark" src="/neutara-mark.svg" alt="neutara" width="29" height="40" />
+      <div><p className="eyebrow">Talent intelligence</p><h1>Candidate Search</h1></div>
+      <p className="secure"><span className="dot" /> Apollo connected</p>
+    </header>
 
     <form className="panel search-panel" onSubmit={submitSearch}>
       {/* No heading or blurb: the field labels already carry Required, so the
@@ -902,12 +924,16 @@ export default function App() {
       </div>
 
       <div className="form-grid">
-          {fields.map(([name, label, placeholder, required]) => <label
+          {fields.map(([name, label, placeholder, required]) => <div
+            className="field"
             key={name}
             ref={name === 'jobTitle' ? roleFieldRef : name === 'keywords' ? skillFieldRef : undefined}
           >
-            {label}{required && <em className="req" aria-hidden="true">Required</em>}
+            <label htmlFor={`field-${name}`}>
+              {label}{required && <em className="req" aria-hidden="true">Required</em>}
+            </label>
             <input
+              id={`field-${name}`}
               name={name}
               value={filters[name]}
               onChange={updateFilter}
@@ -926,6 +952,18 @@ export default function App() {
               aria-expanded={name === 'jobTitle' ? rolesOpen : name === 'keywords' ? skillsOpen : undefined}
               aria-controls={name === 'jobTitle' ? 'role-suggestions' : name === 'keywords' ? 'skill-suggestions' : undefined}
             />
+            {MULTI_VALUE_FIELDS.includes(name) && splitList(filters[name]).length > 0
+              && <ul className={`chips chips-editable ${name === 'location' ? 'location-chips' : 'skill-chips'}`}>
+                {splitList(filters[name]).map((value) => <li key={value} className="chip-on">
+                  <span className="chip-static">{value}</span>
+                  <button
+                    type="button"
+                    className="chip-remove"
+                    aria-label={`Remove ${value}`}
+                    onClick={() => removeValue(name, value)}
+                  >&times;</button>
+                </li>)}
+              </ul>}
             {name === 'keywords' && <>
               <button
                 type="button"
@@ -969,11 +1007,14 @@ export default function App() {
                 </li>)}
               </ul>}
             </>}
-          </label>)}
-          <label>Seniority<select name="seniority" value={filters.seniority} onChange={updateFilter}>
-            <option value="">Any level</option>
-            {SENIORITIES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-          </select></label>
+          </div>)}
+          <div className="field">
+            <label htmlFor="field-seniority">Seniority</label>
+            <select id="field-seniority" name="seniority" value={filters.seniority} onChange={updateFilter}>
+              <option value="">Any level</option>
+              {SENIORITIES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+            </select>
+          </div>
         </div>
         {/* Apollo requires every keyword to match, so each term is held
             separately and can be turned off without retyping the others. */}
@@ -998,8 +1039,12 @@ export default function App() {
           </ol>
         </div>}
 
-        <button type="submit" className="primary" disabled={searching || !canSearch}>{searching ? 'Searching candidates...' : 'Search Candidates'} <span>→</span></button>
-        {!canSearch && <p className="hint">A location is required, along with a role or at least one skill.</p>}
+        <div className="search-actions">
+          <button type="submit" className="primary" disabled={searching || !canSearch}>
+            {searching ? 'Searching...' : 'Search Candidates'} <span>→</span>
+          </button>
+          {!canSearch && <p className="hint">A location is required, along with a role or at least one skill.</p>}
+        </div>
     </form>
 
     {(status || searching || candidates.length > 0) && <section className="results">

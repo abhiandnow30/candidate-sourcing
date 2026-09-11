@@ -1932,3 +1932,105 @@ test('the personal email filter is gone; the address shows on the row instead', 
   const contact = rowFor('Has Personal').querySelector('.candidate-row .contact');
   expect(within(contact).getByRole('link', { name: 'found@example-mail.test' })).toBeTruthy();
 });
+
+// --- Multiple locations -----------------------------------------------------
+
+function locationBox() {
+  return screen.getByLabelText(/^location/i);
+}
+
+function locationChips() {
+  return [...document.querySelectorAll('.location-chips .chip-static')].map((chip) => chip.textContent);
+}
+
+test('one location behaves exactly as it did before', async () => {
+  mockBackend({ search: () => searchResult([bareCandidate('person-1', 'Test Candidate')]) });
+  render(<App />);
+  fireEvent.change(screen.getByLabelText(/role \/ job title/i), { target: { value: 'Frontend Developer' } });
+  fireEvent.change(locationBox(), { target: { value: 'Hyderabad' } });
+
+  // Chips from the first value, so the search always reads as a list.
+  expect(locationChips()).toEqual(['Hyderabad']);
+  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  await screen.findByText('Test Candidate');
+  expect(calls.at(-1).body.location).toBe('Hyderabad');
+});
+
+test('several locations are searched as an OR and each one is shown', async () => {
+  mockBackend({ search: () => searchResult([bareCandidate('person-1', 'Test Candidate')]) });
+  render(<App />);
+  fireEvent.change(screen.getByLabelText(/role \/ job title/i), { target: { value: 'Frontend Developer' } });
+  fireEvent.change(locationBox(), { target: { value: 'Hyderabad, Bangalore, Pune' } });
+
+  expect(locationChips()).toEqual(['Hyderabad', 'Bangalore', 'Pune']);
+  fireEvent.click(screen.getByRole('button', { name: /search candidates/i }));
+  await screen.findByText('Test Candidate');
+  // Sent whole; the backend splits it into the OR Apollo expects.
+  expect(calls.at(-1).body.location).toBe('Hyderabad, Bangalore, Pune');
+});
+
+test('one location can be removed without retyping the others', async () => {
+  mockBackend({ search: () => searchResult([]) });
+  render(<App />);
+  fireEvent.change(locationBox(), { target: { value: 'Hyderabad, Bangalore, Pune' } });
+
+  fireEvent.click(screen.getByRole('button', { name: /remove bangalore/i }));
+  expect(locationChips()).toEqual(['Hyderabad', 'Pune']);
+  expect(locationBox().value).toBe('Hyderabad, Pune');
+
+  fireEvent.click(screen.getByRole('button', { name: /remove pune/i }));
+  expect(locationChips()).toEqual(['Hyderabad']);
+  expect(locationBox().value).toBe('Hyderabad');
+});
+
+test('a location repeated is still one location', async () => {
+  mockBackend({ search: () => searchResult([]) });
+  render(<App />);
+  fireEvent.change(locationBox(), { target: { value: 'Hyderabad, Bangalore, Hyderabad,, Pune ' } });
+  expect(locationChips()).toEqual(['Hyderabad', 'Bangalore', 'Pune']);
+});
+
+test('an empty location is still required, however it is written', async () => {
+  mockBackend({ search: () => searchResult([]) });
+  render(<App />);
+  fireEvent.change(screen.getByLabelText(/role \/ job title/i), { target: { value: 'Frontend Developer' } });
+  const search = screen.getByRole('button', { name: /search candidates/i });
+
+  for (const value of ['', '   ', ' , , ']) {
+    fireEvent.change(locationBox(), { target: { value } });
+    expect(search.disabled, JSON.stringify(value)).toBe(true);
+  }
+  fireEvent.change(locationBox(), { target: { value: 'Hyderabad' } });
+  expect(search.disabled).toBe(false);
+  expect(calls.length).toBe(0);
+});
+
+test('skills get the same removable chips as locations', async () => {
+  mockBackend({ search: () => searchResult([]) });
+  render(<App />);
+  const skills = screen.getByLabelText(/^skills$/i);
+  const skillChipList = () => [...document.querySelectorAll('.skill-chips .chip-static')]
+    .map((chip) => chip.textContent);
+
+  fireEvent.change(skills, { target: { value: 'python, machine learning, python, sql' } });
+  // De-duplicated, and each one shown as its own value rather than as a string
+  // of punctuation.
+  expect(skillChipList()).toEqual(['python', 'machine learning', 'sql']);
+
+  fireEvent.click(screen.getByRole('button', { name: /remove machine learning/i }));
+  expect(skillChipList()).toEqual(['python', 'sql']);
+  expect(skills.value).toBe('python, sql');
+});
+
+test('a field label never picks up the chips as part of its name', async () => {
+  // The chips used to sit inside the label element, which made the field's
+  // accessible name "Skills python x sql x" to a screen reader.
+  mockBackend({ search: () => searchResult([]) });
+  render(<App />);
+  fireEvent.change(screen.getByLabelText(/^skills$/i), { target: { value: 'python, sql' } });
+  fireEvent.change(screen.getByLabelText(/^location/i), { target: { value: 'Hyderabad, Pune' } });
+
+  // Still found by their own names, with the chips rendered outside them.
+  expect(screen.getByLabelText(/^skills$/i).name).toBe('keywords');
+  expect(screen.getByLabelText(/^location/i).name).toBe('location');
+});
