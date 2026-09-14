@@ -174,6 +174,85 @@ export function applyWaterfall(enriched, outcome, { baseById = new Map(), checke
   return next;
 }
 
+// Whether a finished job was charged for but never reached us.
+//
+// Apollo posts the found addresses and numbers to APOLLO_WEBHOOK_URL; polling
+// returns the person ids and a tally, not the contact data itself. So a job
+// whose delivery failed looks exactly like a job that found nothing - same
+// empty fields, same "ready" status - except that Apollo charged for it and
+// says so in its own tally.
+//
+// This matters most on a Cloudflare Quick Tunnel, whose hostname changes every
+// time the tunnel restarts. The pre-flight probe catches a dead URL before a
+// request is sent, but a tunnel that dies mid-job cannot be caught that way:
+// the request was already accepted and the answer is already lost. Without
+// this, that case reported "Apollo holds no number for these candidates" - a
+// confident false negative on data the account had just paid for.
+//
+// Returns null when there is no evidence of loss. Silence is the honest answer
+// here: a job that genuinely found nothing must not be reported as a failure.
+export function deliveryShortfall(result, { kind = 'email' } = {}) {
+  if (!result || result.status !== 'ready') return null;
+  // The webhook copy is the one that carries the contact data. If it arrived,
+  // nothing was lost.
+  if (result.deliveredByWebhook) return null;
+
+  const candidates = Array.isArray(result.candidates) ? result.candidates : [];
+  const hasContact = (candidate) => (kind === 'phone'
+    ? Boolean(candidate?.phone)
+    : Boolean(candidate?.personalEmail || candidate?.email));
+  // Delivery is all-or-nothing per request, so anything with contact data on it
+  // means the payload reached us.
+  if (candidates.some(hasContact)) return null;
+
+  const creditsConsumed = Number(result.summary?.creditsConsumed) || 0;
+  const emailsFound = Number(result.summary?.emailsFound) || 0;
+  // Only Apollo's own words count as a stated failure; an unrecognised status
+  // is not read as one.
+  const stated = /fail|error/i.test(String(result.delivery?.status || ''));
+
+  if (!stated && !creditsConsumed && !emailsFound) return null;
+  return {
+    creditsConsumed,
+    emailsFound,
+    // Apollo's reason when it gave one, so the recruiter sees what Apollo said
+    // rather than only what we inferred.
+    failureReason: result.delivery?.failureReason || null
+  };
+}
+
+// What to tell the recruiter when a job was charged for but never delivered.
+// Names the environment variable and the restart, because on a Quick Tunnel
+// that is always the fix.
+export function deliveryShortfallMessage(jobs, { kind = 'email' } = {}) {
+  const thing = kind === 'phone' ? 'phone number' : 'email address';
+  const credits = jobs.reduce((total, job) => total + (job.creditsConsumed || 0), 0);
+  const reason = jobs.map((job) => job.failureReason).find(Boolean);
+  return [
+    `Apollo finished ${jobs.length === 1 ? 'this request' : `${jobs.length} of these requests`} and charged for ${jobs.length === 1 ? 'it' : 'them'}`,
+    credits ? ` (${credits} credit${credits === 1 ? '' : 's'})` : '',
+    `, but could not deliver the result to APOLLO_WEBHOOK_URL, so the ${thing}s it found never arrived.`,
+    reason ? ` Apollo reported: ${reason}.` : '',
+    ' This is what happens when a Cloudflare Quick Tunnel restarts: it issues a new hostname and the old one stops answering.',
+    ' Restart the tunnel, put the new URL in APOLLO_WEBHOOK_URL, and restart the API server - .env is only read at startup.',
+    ` These candidates are left unanswered rather than marked as having no ${thing}, because it is not known whether one was found.`
+  ].join('');
+}
+
+// Strips the flags by which a record claims to be an answer about somebody.
+//
+// A polled record carries phoneChecked/waterfallChecked set by the server,
+// because normally it *is* the answer. When its delivery failed it is not: the
+// contact data went to a dead webhook and what is left says only "Apollo
+// finished". Merging those flags told the row it had been answered - so it
+// showed "No phone number found" and the retry guard blocked asking again -
+// while the status message said the opposite. Passing `mark: {}` did not stop
+// it, because the flags ride in on the record itself, not on the mark.
+export function withoutAnswerFlags(candidate) {
+  const { phoneChecked, waterfallChecked, contactRevealed, ...rest } = candidate || {};
+  return rest;
+}
+
 // Reveal reports on addresses, not just matches: a candidate Apollo matched but
 // has no email for is a real, useful outcome and must not read as a failure.
 export function revealSummary(outcome) {

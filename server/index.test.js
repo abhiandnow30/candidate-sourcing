@@ -1069,3 +1069,46 @@ test('the store can be turned off outright', async () => {
   });
   delete process.env.CANDIDATE_CACHE;
 });
+
+// --- A sparse answer must not erase what was already paid for --------------
+//
+// A phone webhook payload, a waterfall husk and a plain search row all carry
+// empty arrays and `false` for every field they do not speak to. Merging those
+// as statements wiped the skills and employment history off a candidate already
+// enriched, while leaving `enriched: true` on the row - so the details panel
+// showed "Not available" for data the account had been charged for.
+
+test('a sparse later answer does not erase a stored enrichment', async () => {
+  const { saveCandidates, readCached, NEEDS_ENRICHED, clearCache } = await import('./store.js');
+  clearCache();
+
+  saveCandidates([{
+    id: 'person-1', name: 'Test Candidate', email: 'work@example-co.test',
+    skills: ['Java', 'AWS'], departments: ['engineering'],
+    employmentHistory: [{ organization: 'Example Co', title: 'Java Developer', current: true }],
+    emailAvailable: true
+  }], { enriched: true });
+
+  // The husk a phone job delivers: an id, a number, and nothing else it knows.
+  saveCandidates([{
+    id: 'person-1', name: null, skills: [], departments: [], employmentHistory: [],
+    emailAvailable: false, phone: '+1 555 0100 111'
+  }], { phone: true });
+
+  const held = readCached(['person-1'], NEEDS_ENRICHED).get('person-1');
+  assert.deepEqual(held.skills, ['Java', 'AWS'], 'skills survived the sparse save');
+  assert.deepEqual(held.departments, ['engineering']);
+  assert.equal(held.employmentHistory.length, 1, 'employment history survived');
+  assert.equal(held.emailAvailable, true, 'a false on a sparse answer is an absence, not a correction');
+  assert.equal(held.name, 'Test Candidate');
+  // What the sparse answer did actually state is written.
+  assert.equal(held.phone, '+1 555 0100 111');
+});
+
+test('stated() keeps only the fields an answer really makes a claim about', async () => {
+  const { stated } = await import('./store.js');
+  assert.deepEqual(
+    stated({ a: 'x', b: 1, c: true, d: null, e: undefined, f: '', g: false, h: [], i: ['v'] }),
+    { a: 'x', b: 1, c: true, i: ['v'] }
+  );
+});

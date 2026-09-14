@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'vitest';
 import {
   ENRICHED, ENRICHING, FAILED, NOT_ENRICHED, REVEALING,
-  applyEnriched, applyStates, applyWaterfall, enrichmentLabel, enrichmentSummary, idsToEnrich, idsToReveal,
+  applyEnriched, applyStates, applyWaterfall, deliveryShortfall, deliveryShortfallMessage,
+  enrichmentLabel, enrichmentSummary, idsToEnrich, idsToReveal,
   markState, mergeCandidate, reconcile, revealSummary, stateOf
 } from './enrichment.js';
 
@@ -325,3 +326,105 @@ test('mergeCandidate never lets an absence overwrite a known value', () => {
   expect(merged.emailAvailable).toBe(true);
   expect(merged.phone).toBeUndefined();
 });
+
+// --- Webhook delivery loss -------------------------------------------------
+//
+// Apollo posts the found contact data to APOLLO_WEBHOOK_URL and charges for it
+// either way; polling returns person ids and a tally, never the addresses. On a
+// Cloudflare Quick Tunnel the hostname changes on every restart, so a tunnel
+// that dies mid-job loses the answer after Apollo has already been paid. The
+// polled copy of that job is indistinguishable from "found nothing" except for
+// Apollo's own tally, so these lock in reading the tally.
+
+// A finished job as polling returns it: person ids, no contact data.
+const polledResult = (overrides = {}) => ({
+  status: 'ready', kind: 'phone',
+  candidates: [waterfallAnswer('person-1')],
+  ...overrides
+});
+
+describe('webhook delivery loss', () => {
+  test('a charged job whose answer never arrived is reported', () => {
+    const shortfall = deliveryShortfall(polledResult({
+      summary: { creditsConsumed: 3, emailsFound: 0 }
+    }), { kind: 'phone' });
+
+    expect(shortfall).not.toBeNull();
+    expect(shortfall.creditsConsumed).toBe(3);
+  });
+
+  test("Apollo's stated delivery failure is enough on its own", () => {
+    const shortfall = deliveryShortfall(polledResult({
+      delivery: { status: 'failed', failureReason: 'connection refused' }
+    }), { kind: 'phone' });
+
+    expect(shortfall).not.toBeNull();
+    expect(shortfall.failureReason).toBe('connection refused');
+  });
+
+  test('a job that genuinely found nothing is not called a failure', () => {
+    // Nothing found, nothing charged: a real answer, and a free one. Reporting
+    // this as lost data would cry wolf on every empty search.
+    expect(deliveryShortfall(polledResult({
+      summary: { creditsConsumed: 0, emailsFound: 0 },
+      delivery: { status: 'delivered', failureReason: null }
+    }), { kind: 'phone' })).toBeNull();
+
+    // No tally at all is not evidence of loss either.
+    expect(deliveryShortfall(polledResult(), { kind: 'phone' })).toBeNull();
+  });
+
+  test('a delivered payload is never reported as lost', () => {
+    // The webhook copy is the one carrying the contact data, so its arrival
+    // settles the question whatever the tally says.
+    expect(deliveryShortfall(polledResult({
+      deliveredByWebhook: true,
+      summary: { creditsConsumed: 3, emailsFound: 1 }
+    }), { kind: 'phone' })).toBeNull();
+
+    // Contact data on the record proves the same thing.
+    expect(deliveryShortfall(polledResult({
+      candidates: [waterfallAnswer('person-1', { phone: '+1 555 0100 999' })],
+      summary: { creditsConsumed: 3 }
+    }), { kind: 'phone' })).toBeNull();
+  });
+
+  test('an unfinished job is not judged at all', () => {
+    expect(deliveryShortfall({ status: 'pending' }, { kind: 'phone' })).toBeNull();
+    expect(deliveryShortfall({ status: 'expired' }, { kind: 'phone' })).toBeNull();
+    expect(deliveryShortfall(null, { kind: 'phone' })).toBeNull();
+  });
+
+  test('email and phone jobs read their own kind of contact data', () => {
+    // A phone job that returned an email address found no number, so its
+    // answer is still missing.
+    expect(deliveryShortfall(polledResult({
+      candidates: [waterfallAnswer('person-1', { email: 'work@example-co.test' })],
+      summary: { creditsConsumed: 1 }
+    }), { kind: 'phone' })).not.toBeNull();
+
+    // The same record answers an email job.
+    expect(deliveryShortfall(polledResult({
+      candidates: [waterfallAnswer('person-1', { email: 'work@example-co.test' })],
+      summary: { creditsConsumed: 1 }
+    }), { kind: 'email' })).toBeNull();
+  });
+
+  test('the message names the fix, not just the fault', () => {
+    const text = deliveryShortfallMessage(
+      [{ creditsConsumed: 2, emailsFound: 0, failureReason: 'connection refused' }],
+      { kind: 'phone' }
+    );
+
+    // A recruiter reading this must be able to act on it without reading code.
+    expect(text).toMatch(/APOLLO_WEBHOOK_URL/);
+    expect(text).toMatch(/Quick Tunnel/i);
+    expect(text).toMatch(/restart the API server/i);
+    expect(text).toMatch(/2 credits/);
+    expect(text).toMatch(/connection refused/);
+    // It must not claim the candidates have no number - that is the false
+    // negative this whole path exists to prevent.
+    expect(text).not.toMatch(/holds no phone/i);
+  });
+});
+

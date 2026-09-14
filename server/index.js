@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { enrichPeople, matchPerson, normalizeWaterfallCandidate, pollWaterfallResult, requestPhoneNumbers, requestWaterfallEmails, searchPeople, splitList } from './apolloService.js';
-import { NEEDS_ENRICHED, NEEDS_PHONE, NEEDS_REVEALED, readCached, saveCandidates } from './store.js';
+import { NEEDS_ENRICHED, NEEDS_PHONE, NEEDS_REVEALED, readCached, saveCandidates, stated } from './store.js';
 
 // Credit guard: the most people one /enrich call will forward to Apollo.
 // Anything beyond this is reported back as skipped, never silently dropped.
@@ -162,7 +162,7 @@ app.post('/api/candidates/search', async (request, response) => {
         // wins on the fields it actually carries; the stored record supplies
         // everything a search never returns.
         return held
-          ? { ...held, ...Object.fromEntries(Object.entries(candidate).filter(([, value]) => value !== null && value !== undefined && value !== '')), enriched: true, fromCache: true }
+          ? { ...held, ...stated(candidate), enriched: true, fromCache: true }
           : candidate;
       })
     });

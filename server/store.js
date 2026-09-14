@@ -26,6 +26,29 @@ import { fileURLToPath } from 'node:url';
 const DEFAULT_TTL_DAYS = 90;
 
 // Which timestamp a request needs, by what it would otherwise pay for.
+// Whether an incoming field actually says something, and so may overwrite what
+// is already stored.
+//
+// A sparse answer - a waterfall husk, a phone webhook payload, a plain search
+// row - carries empty arrays and `false` for every field it simply does not
+// speak to. Treating those as statements is what let a phone result wipe the
+// skills and employment history of a candidate already paid for, while leaving
+// `enriched: true` on the row so the details panel showed "Not available" for
+// all of it.
+//
+// Same rule as `present()` on the client, so both sides of the wire merge a
+// sparse record identically: every flag on a candidate is a positive assertion,
+// so a `false` arriving on a sparse answer is an absence, not a correction.
+export function present(value) {
+  if (value === null || value === undefined || value === '' || value === false) return false;
+  return Array.isArray(value) ? value.length > 0 : true;
+}
+
+// Only the fields an answer actually states, for merging over a stored record.
+export function stated(candidate) {
+  return Object.fromEntries(Object.entries(candidate).filter(([, value]) => present(value)));
+}
+
 export const NEEDS_ENRICHED = 'enriched_at';
 export const NEEDS_REVEALED = 'revealed_at';
 export const NEEDS_PHONE = 'phone_at';
@@ -114,7 +137,7 @@ export function saveCandidates(candidates, marks = {}) {
     if (existing?.data) {
       try {
         const previous = JSON.parse(existing.data);
-        merged = { ...previous, ...Object.fromEntries(Object.entries(candidate).filter(([, value]) => value !== null && value !== undefined)) };
+        merged = { ...previous, ...stated(candidate) };
       } catch { /* unreadable row: this answer replaces it outright */ }
     }
     // `fromCache` describes how a record reached the client, not the record, so

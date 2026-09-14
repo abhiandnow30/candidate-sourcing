@@ -2210,3 +2210,115 @@ test('a field label never picks up the chips as part of its name', async () => {
   // Still found by its own name, with the chips rendered outside the label.
   expect(screen.getByLabelText(/^skills$/i).name).toBe('keywords');
 });
+
+
+// --- Regressions: three ways the status line used to state something false --
+
+test('a lost delivery leaves the row unanswered, not "no number found"', async () => {
+  // Apollo finished and charged; the numbers went to a webhook that had died.
+  // The polled record still carries phoneChecked: true, because normally it IS
+  // the answer. Merging that flag told the row it had been answered and blocked
+  // the retry, while the message said the opposite.
+  await phoneFlow([bareCandidate('person-1', 'Test Candidate')], {
+    phone: () => ({
+      requestedIds: ['person-1'],
+      requests: [{ requestId: '991', ids: ['person-1'] }],
+      candidates: [], failedIds: [], skippedIds: []
+    }),
+    poll: () => ({
+      status: 'ready', kind: 'phone',
+      candidates: [phoneAnswer('person-1')],
+      summary: { creditsConsumed: 2, emailsFound: 0 },
+      delivery: { status: 'failed', failureReason: 'connection refused' }
+    })
+  });
+
+  await screen.findByText(/could not deliver the result to APOLLO_WEBHOOK_URL/i);
+  const contact = rowFor('Test Candidate').querySelector('.candidate-row .contact');
+  // Nobody knows whether a number was found, so the row must not claim there
+  // is none - that is the false negative the whole path exists to prevent.
+  expect(within(contact).queryByText('No phone number found')).toBeNull();
+});
+
+test('numbers served from the store are not reported as "none found"', async () => {
+  // Everything was already paid for, so the backend answers with no jobs at
+  // all. The polling loop never runs, and the summary used to conclude that
+  // nothing was found while the number sat on the row.
+  await phoneFlow([bareCandidate('person-1', 'Test Candidate')], {
+    phone: () => ({
+      requestedIds: ['person-1'],
+      requests: [],
+      candidates: [phoneAnswer('person-1', { phone: '+1 555 0100 111' })],
+      failedIds: [], skippedIds: [], fromCacheIds: ['person-1']
+    }),
+    poll: null
+  });
+
+  await screen.findByText(/found 1 phone number/i);
+  expect(screen.queryByText(/apollo holds no phone number/i)).toBeNull();
+});
+
+test('a failed poll reports the failure instead of "none found"', async () => {
+  await phoneFlow([bareCandidate('person-1', 'Test Candidate')], {
+    phone: () => ({
+      requestedIds: ['person-1'],
+      requests: [{ requestId: '991', ids: ['person-1'] }],
+      candidates: [], failedIds: [], skippedIds: []
+    }),
+    poll: () => { throw new Error('The candidate API is not running.'); }
+  });
+
+  // The real error must survive the summary that runs on every exit path.
+  await screen.findByText(/the candidate api is not running/i);
+  expect(screen.queryByText(/apollo holds no phone number/i)).toBeNull();
+});
+
+test('a slow earlier search cannot overwrite a faster later one', async () => {
+  // Every filter change fires a search and Apollo does not answer in order, so
+  // two quick changes could land backwards and leave the table showing the
+  // older query's rows under the newer query's filters.
+  //
+  // Each response is held open at text(), which is where readJson awaits, so
+  // this test decides the order the answers come back in.
+  const pending = [];
+  mockBackend({
+    search: () => {
+      const index = pending.length;
+      const payload = searchResult([bareCandidate(`p${index}`, `Result of search ${index}`)]);
+      let open;
+      const gate = new Promise((resolve) => { open = resolve; });
+      const response = {
+        ok: true, status: 200,
+        text: async () => { await gate; return JSON.stringify(payload); },
+        json: async () => { await gate; return payload; },
+        clone() { return response; }
+      };
+      pending.push({ open, index });
+      return response;
+    }
+  });
+  render(<App />);
+  fillRequired();
+  applySearch();
+  await waitFor(() => expect(pending.length).toBeGreaterThan(0));
+
+  fillRequired({ jobTitle: 'python developer', keywords: 'python' });
+  applySearch();
+  await waitFor(() => expect(pending.length).toBeGreaterThan(1));
+
+  const newest = pending[pending.length - 1];
+  const older = pending.slice(0, -1);
+
+  // The newest answers first; every earlier one arrives late.
+  newest.open();
+  await screen.findByText(`Result of search ${newest.index}`);
+  for (const stale of older) stale.open();
+
+  // A late answer must not replace what is on screen.
+  await waitFor(() => {
+    for (const stale of older) {
+      expect(screen.queryByText(`Result of search ${stale.index}`)).toBeNull();
+    }
+  });
+  expect(screen.getByText(`Result of search ${newest.index}`)).toBeTruthy();
+});

@@ -5,6 +5,65 @@ Newest entry first. Branch: `dev-branch`.
 
 ---
 
+## 2026-09-13 — In progress (uncommitted)
+
+Webhook delivery-failure handling and configuration docs. Keeps the Cloudflare
+Quick Tunnel as the local dev webhook; no change to the webhook implementation.
+
+- **Delivery loss is now detected** — `src/enrichment.js` gains
+  `deliveryShortfall()` and `deliveryShortfallMessage()`. Apollo posts the found
+  contact data to `APOLLO_WEBHOOK_URL` and charges either way; polling returns
+  only person IDs and a tally. `pollWaterfallResult` already computed that tally
+  (`summary.creditsConsumed`, `delivery.status`) and the API already forwarded
+  it — nothing read it. So a tunnel that died mid-job reported "Apollo holds no
+  phone number for these candidates": a false negative on data just paid for.
+- **Those rows are no longer marked answered** — `src/App.jsx` applies a lost
+  result with no `phoneChecked` mark, so the row stays unanswered instead of
+  claiming no number exists. The recruiter is told which env var to fix and that
+  the API server must restart.
+- **Pre-flight guard unchanged** — `webhookUnreachableReason` already refuses a
+  dead hostname before spending, naming it. That covers the URL changing between
+  requests; the new code covers it changing mid-request, which a probe cannot.
+- **Docs** — README gains a "Webhook configuration" section: the URL is env-only
+  and used verbatim, the quick tunnel hostname is temporary and changes on every
+  restart, and deployment swaps in a permanent HTTPS URL with no code change.
+  `.env.example` carries the same warning where it is actually read.
+- **Tests** — 7 added to `src/enrichment.test.js` (253 passing: 121 server, 132
+  UI). Covers charged-but-undelivered, Apollo-stated failure, genuine empty
+  result, webhook-delivered, unfinished jobs, and email/phone kind separation.
+
+**Search other sources: wired up, tested against live Apollo, removed.**
+
+Added as a third spending button, then removed the same day once live testing
+showed what Apollo actually does with it.
+
+- **The finding.** Three candidates were searched. Every stored record came back
+  `vendors: [{"name":"Apollo","status":"VERIFIED","statusCode":"apollo_step_success"}]`
+  — only Apollo ran, no third-party vendor was queried on any of them. Apollo's
+  waterfall stops as soon as its own step finds an address; it searches for *an*
+  email, not a *personal* one. All three already had a work address, so it was
+  satisfied before reaching the vendors that were the whole point.
+- **Why that kills the feature as offered.** For any candidate Apollo already
+  holds an email for, the route costs more than a reveal and returns what a
+  reveal returns. The app's search asks Apollo for people whose address it rates
+  verified or likely, so that is most of them.
+- **It corrected an earlier mistake of mine.** When wiring it up I argued a
+  reveal first was wasteful because the waterfall does one anyway, so the button
+  was offered on every candidate. The evidence inverts that: an email already on
+  file is precisely what *stops* the waterfall. Gating should have been to
+  `hasEmailOnFile: false`, not to everyone.
+- **Not a delivery failure.** The tunnel was up, the webhook delivered, and the
+  records are in the store. The empty result was real.
+- **Removed:** button, `searchOtherSources`/`runSourceSearch`, `sourceIds`,
+  `WATERFALL_LIMIT`, `idsToSearchSources`, the `.reveal.deep` style, and the 11
+  tests covering them. Back to 253 passing (121 server, 132 UI).
+- **Kept:** the backend route, parser and polling (untouched and still tested);
+  `collectAsyncJobs`, now phone-only; and `deliveryShortfall`, which the phone
+  path uses.
+- **Open question if revisited:** whether the waterfall reaches outside vendors
+  for a candidate with no email on file. Never tested. Gate to those candidates
+  and confirm a non-Apollo name appears in `vendors` before trusting it.
+
 ## 2026-09-11 — In progress (uncommitted)
 
 Multi-location search plus chip editing for list fields. 6 files changed, ~340 lines.

@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ENRICHED, ENRICHING, FAILED, NOT_ENRICHED, REVEALING, REVEALING_PHONE,
-  applyEnriched, applyStates, applyWaterfall, enrichmentLabel, enrichmentSummary, idsToEnrich, idsToReveal,
-  idsToRevealPhone, markState, mergeCandidate, reconcile, revealSummary, stateOf
+  applyEnriched, applyStates, applyWaterfall, deliveryShortfall, deliveryShortfallMessage,
+  enrichmentLabel, enrichmentSummary, idsToEnrich, idsToReveal,
+  idsToRevealPhone, markState, mergeCandidate, reconcile, revealSummary, stateOf, withoutAnswerFlags
 } from './enrichment.js';
 
 // personName is not one of the form fields: it is driven by the results search
@@ -551,6 +552,9 @@ export default function App() {
   // the ref survives the double-invoke React does in development, which would
   // otherwise open the app with two identical requests.
   const openedRef = useRef(false);
+  // Which search is the newest. Compared after every await so a slow answer
+  // cannot overwrite a faster one sent later.
+  const searchTicket = useRef(0);
   useEffect(() => {
     if (openedRef.current) return;
     openedRef.current = true;
@@ -654,6 +658,14 @@ export default function App() {
   // React has not re-rendered yet at that point, so reading it from state here
   // would send the previous value.
   async function search(nextPage = 1, overrides = {}, matchAll = matchAllSkills) {
+    // Every filter change fires a search, and Apollo does not answer them in
+    // the order they were sent. Without this, two quick chip toggles could land
+    // out of order and leave the table and the pool count showing the older
+    // query. Only the newest search may write to the screen; the rest still run
+    // to completion (they are already paid for) but their answers are dropped.
+    const ticket = ++searchTicket.current;
+    const current = () => searchTicket.current === ticket;
+
     setLoading('search'); setStatus(null); setPage(nextPage);
     const query = queryFor(overrides);
     const keywords = query.keywords;
@@ -669,6 +681,7 @@ export default function App() {
         response = await send();
       }
       const data = await readJson(response);
+      if (!current()) return;
       setCandidates(data.candidates); setTotal(data.total); setSelected(new Set());
       // Rows the backend served from our own store are already enriched: the
       // credit was spent on a previous search, so the details open without
@@ -725,8 +738,12 @@ export default function App() {
               : 'No matching candidates found.'
         });
       }
-    } catch (error) { setStatus({ type: 'error', text: error.message || 'Unable to connect to Apollo. Please try again.' }); }
-    finally { setLoading(''); }
+    } catch (error) {
+      if (current()) setStatus({ type: 'error', text: error.message || 'Unable to connect to Apollo. Please try again.' });
+    } finally {
+      // A superseded search must not clear the spinner the newer one set.
+      if (current()) setLoading('');
+    }
   }
 
   // Enter anywhere in the filter form. Every field commits its own value on
@@ -896,22 +913,55 @@ export default function App() {
       }));
       setExpanded((previous) => new Set([...previous, ...immediate.matchedIds]));
 
-      setStatus({ type: 'info', text: [notice, `Asking Apollo for ${requested.length} phone number${requested.length === 1 ? '' : 's'}. Numbers arrive here as Apollo returns them.`].filter(Boolean).join(' ') });
-      await collectPhones(data.requests || [], requested, before, notice);
+      // Numbers that needed no job at all: served from the cache, or held by
+      // Apollo and returned on the spot. They are already on the rows, so the
+      // summary must count them or it reports "none found" over a visible number.
+      const alreadyFound = [...immediate.candidatesByKey.values()].filter((candidate) => candidate.phone).length;
+      const stillComing = (data.requests || []).length;
+
+      if (stillComing) {
+        setStatus({ type: 'info', text: [notice, `Asking Apollo for ${requested.length} phone number${requested.length === 1 ? '' : 's'}. Numbers arrive here as Apollo returns them.`].filter(Boolean).join(' ') });
+      }
+      await collectAsyncJobs(data.requests || [], { kind: 'phone', before, notice, alreadyFound });
     } catch (error) {
       setStates((previous) => new Map([...previous, ...before]));
       setStatus({ type: 'error', text: error.message || 'Unable to reveal phone numbers.' });
     } finally { setLoading(''); }
   }
 
-  // Polls each outstanding phone job. Polling costs no credits, so the only
-  // cost of waiting is time.
-  async function collectPhones(requests, requested, before = new Map(), notice = '') {
+  // What an asynchronous job needs beyond the polling itself. Phone is the only
+  // one now: the email waterfall had a button here and it was removed, because
+  // Apollo stops the waterfall as soon as its own step finds an address, so for
+  // anyone with a work email on file it never reached the third-party vendors
+  // and only ever returned what a plain reveal already gives.
+  const ASYNC_JOBS = {
+    phone: {
+      mark: { phoneChecked: true },
+      // What counts as this job having found something for a candidate.
+      found: (candidate) => Boolean(candidate.phone),
+      readFailure: 'Unable to read the phone result.',
+      foundText: (n) => `Found ${n} phone number${n === 1 ? '' : 's'}.`,
+      expiredText: (n) => `Apollo could not return ${n === 1 ? 'the result' : `${n} of the results`} for this request, so it is unknown whether a number was found. Try again before spending more.`,
+      stillRunningText: 'Apollo is still working on this. Numbers were not ready in time; try again shortly.',
+      emptyText: 'Apollo holds no phone number for these candidates.'
+    }
+  };
+
+  // Polls each outstanding asynchronous job. Polling costs no credits, so the
+  // only cost of waiting is time.
+  async function collectAsyncJobs(requests, { kind, before = new Map(), notice = '', alreadyFound = 0 }) {
+    const job_ = ASYNC_JOBS[kind];
     const deadline = Date.now() + WATERFALL_MAX_WAIT_MS;
     const outstanding = [...requests];
     const baseById = baseCandidateMap();
     let found = 0;
     let expired = 0;
+    // Why the loop stopped early, if it did. Reported ahead of any summary: not
+    // knowing an answer is a different thing from knowing there is none.
+    let readError = '';
+    // Jobs Apollo charged for whose answer never reached the webhook. Kept
+    // apart from `expired`: Apollo finished these, so retrying spends again.
+    const undelivered = [];
 
     while (outstanding.length && Date.now() < deadline) {
       const job = outstanding.shift();
@@ -919,7 +969,10 @@ export default function App() {
       try {
         result = await readJson(await fetch(`/api/candidates/waterfall/${encodeURIComponent(job.requestId)}`));
       } catch (error) {
-        setStatus({ type: 'error', text: error.message || 'Unable to read the phone result.' });
+        // Kept rather than set here: the summary below runs on every exit from
+        // this loop, and setting it now only to be overwritten there is how the
+        // real error used to be replaced by "Apollo holds no number".
+        readError = error.message || job_.readFailure;
         break;
       }
 
@@ -929,25 +982,49 @@ export default function App() {
         continue;
       }
       if (result.status === 'ready') {
-        const outcome = reconcile(job.ids, { candidates: result.candidates, skippedIds: [] });
-        setEnriched((previous) => applyWaterfall(previous, outcome, {
-          baseById, checkedIds: job.ids, mark: { phoneChecked: true }
-        }));
+        const shortfall = deliveryShortfall(result, { kind });
+        // A job whose answer was lost in transit is not an answer about anybody,
+        // so the record is stripped of the flags that claim it is one. Clearing
+        // the mark alone was not enough: the server sets those flags on the
+        // record itself, and the merge carried them in regardless.
+        const answered = shortfall
+          ? result.candidates.map(withoutAnswerFlags)
+          : result.candidates;
+        const outcome = reconcile(job.ids, { candidates: answered, skippedIds: [] });
+        setEnriched((previous) => applyWaterfall(previous, outcome, shortfall
+          ? { baseById, checkedIds: [], mark: {} }
+          : { baseById, checkedIds: job.ids, mark: job_.mark }));
         setExpanded((previous) => new Set([...previous, ...outcome.matchedIds]));
-        found += result.candidates.filter((candidate) => candidate.phone).length;
+        if (shortfall) undelivered.push(shortfall);
+        found += result.candidates.filter(job_.found).length;
       }
       if (result.status === 'expired') expired += 1;
     }
 
     setStates((previous) => new Map([...previous, ...before]));
-    if (found) {
-      setStatus({ type: 'success', text: [notice, `Found ${found} phone number${found === 1 ? '' : 's'}.`].filter(Boolean).join(' ') });
+    // Reported even alongside numbers that did arrive: a partial delivery still
+    // means the account paid for answers it never received.
+    const lost = undelivered.length ? deliveryShortfallMessage(undelivered, { kind }) : '';
+    // Anything already on screen for these people counts as found, whether it
+    // came from this poll or was served from the cache without a job at all.
+    // Without this, a fully cached answer reported "none found" with the
+    // numbers visible on the rows.
+    found += alreadyFound;
+    if (readError) {
+      setStatus({ type: 'error', text: [notice, readError].filter(Boolean).join(' ') });
+    } else if (found) {
+      setStatus({
+        type: lost ? 'error' : 'success',
+        text: [notice, job_.foundText(found), lost].filter(Boolean).join(' ')
+      });
+    } else if (lost) {
+      setStatus({ type: 'error', text: [notice, lost].filter(Boolean).join(' ') });
     } else if (expired) {
-      setStatus({ type: 'error', text: `Apollo could not return ${expired === 1 ? 'the result' : `${expired} of the results`} for this request, so it is unknown whether a number was found. Try again before spending more.` });
+      setStatus({ type: 'error', text: job_.expiredText(expired) });
     } else if (outstanding.length) {
-      setStatus({ type: 'info', text: 'Apollo is still working on this. Numbers were not ready in time; try again shortly.' });
+      setStatus({ type: 'info', text: job_.stillRunningText });
     } else {
-      setStatus({ type: 'info', text: 'Apollo holds no phone number for these candidates.' });
+      setStatus({ type: 'info', text: [notice, job_.emptyText].filter(Boolean).join(' ') });
     }
   }
 
