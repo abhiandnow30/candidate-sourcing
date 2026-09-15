@@ -667,24 +667,14 @@ test('submitting an empty form searches the pool rather than refusing', async ()
   // No scolding: there is nothing the recruiter has failed to provide.
   expect(screen.queryByText(/is required/i)).toBeNull();
 });
-// --- Explicit personal email reveal -----------------------------------------
-
-const revealResponse = (candidates) => ({
-  requestedIds: candidates.map((candidate) => candidate.requestedId),
-  candidates,
-  failedIds: [],
-  skippedIds: [],
-  revealedPersonalEmails: true
-});
-
-function revealButton() {
-  return screen.getByRole('button', { name: /^reveal email/i });
-}
-
-// One click is the whole action now: the cost is on the button before it.
-function revealAndConfirm(button) {
-  fireEvent.click(button || revealButton());
-}
+// --- Contact data on the row ------------------------------------------------
+//
+// "Reveal personal email" was removed: it and /enrich are the same Apollo call
+// bar one flag, so enrichment already returned the work address, and measured
+// against this account Apollo held a personal address for none of the
+// candidates the reveal was spent on. The display logic for a personal address
+// stays - one can still arrive from the store or from a future path - so these
+// drive it through enrichment instead.
 
 test('a search never reveals contact details on its own', async () => {
   await searchWith([bareCandidate('person-1', 'Test Candidate')]);
@@ -692,150 +682,17 @@ test('a search never reveals contact details on its own', async () => {
   expect(calls.some((call) => call.url === '/api/candidates/reveal')).toBe(false);
 });
 
-test('reveal sends only the explicitly selected candidates', async () => {
-  await searchWith(
-    [bareCandidate('person-1', 'Test Candidate'), bareCandidate('person-2', 'Other Candidate')],
-    undefined,
-    () => revealResponse([enrichedCandidate('person-1', 'Test Candidate', { email: 'one@example.com' })])
-  );
-  fireEvent.click(screen.getByRole('checkbox', { name: /select test candidate/i }));
-  revealAndConfirm();
-
-  await waitFor(() => expect(calls.some((call) => call.url === '/api/candidates/reveal')).toBe(true));
-  const call = calls.find((entry) => entry.url === '/api/candidates/reveal');
-  expect(call.body.ids).toEqual(['person-1']);
-  expect(call.body.ids).not.toContain('person-2');
-});
-
-test('a running reveal shows a loading state and blocks a second request', async () => {
-  let release;
-  const pending = new Promise((resolve) => { release = resolve; });
-  await searchWith(
-    [bareCandidate('person-1', 'Test Candidate')],
-    undefined,
-    async () => {
-      await pending;
-      return revealResponse([enrichedCandidate('person-1', 'Test Candidate', { email: 'one@example.com' })]);
-    }
-  );
-  fireEvent.click(screen.getByRole('checkbox', { name: /select test candidate/i }));
-  revealAndConfirm();
-
-  // The toolbar button and the row badge both report the reveal, so each is
-  // asserted where it lives rather than by a page-wide text match.
-  await waitFor(() => expect(within(rowFor('Test Candidate')).getByText('Revealing contact details...')).toBeTruthy());
-  expect(screen.getByRole('button', { name: /^revealing email/i }).disabled).toBe(true);
-  expect(screen.getByRole('button', { name: /^enrich selected/i }).disabled).toBe(true);
-
-  release();
-  await waitFor(() => expect(within(rowFor('Test Candidate')).queryByText('Revealing contact details...')).toBeNull());
-  expect(within(rowFor('Test Candidate')).getByText('Enriched')).toBeTruthy();
-});
-
-test('a partial reveal shows the address it got and Not available for the rest', async () => {
-  await searchWith(
-    [bareCandidate('person-1', 'Test Candidate'), bareCandidate('person-2', 'Other Candidate')],
-    undefined,
-    () => revealResponse([
-      enrichedCandidate('person-1', 'Test Candidate', { email: 'one@example.com', emailAvailable: true }),
-      enrichedCandidate('person-2', 'Other Candidate', { email: null, emailAvailable: false })
-    ])
-  );
-  selectEveryRow();
-  revealAndConfirm();
-
-  const found = await detailsPanel('Test Candidate');
-  expect(within(found).getByText('one@example.com')).toBeTruthy();
-  expect(within(found).getByRole('link', { name: 'one@example.com' }).getAttribute('href')).toBe('mailto:one@example.com');
-
-  const missing = await detailsPanel('Other Candidate');
-  const missingEmail = within(missing).getByText('Work email').parentElement;
-  expect(within(missingEmail).getByText('Not available')).toBeTruthy();
-  expect(missing.textContent).not.toContain('@example.com');
-});
-
-test('a failed reveal keeps the candidate enriched instead of erasing the row', async () => {
-  await searchWith(
-    [bareCandidate('person-1', 'Test Candidate')],
-    () => ({
-      requestedIds: ['person-1'],
-      candidates: [enrichedCandidate('person-1', 'Test Candidate', { email: null, emailAvailable: false })],
-      failedIds: [],
-      skippedIds: []
-    }),
-    () => new Error('Apollo API rate limit reached. Please try again later.')
-  );
-  fireEvent.click(screen.getByRole('checkbox', { name: /select test candidate/i }));
-  fireEvent.click(screen.getByRole('button', { name: /^enrich selected/i }));
-  await detailsPanel('Test Candidate');
-
-  revealAndConfirm(within(rowFor('Test Candidate')).getByRole('button', { name: /^reveal email/i }));
-  await screen.findByText(/rate limit/i);
-
-  // The reveal failed, so the row keeps the enrichment it already had.
-  expect(within(rowFor('Test Candidate')).getByText('Enriched')).toBeTruthy();
-  await detailsPanel('Test Candidate');
-});
-
-test('a second reveal does not pay for an address already on screen', async () => {
-  await searchWith(
-    [bareCandidate('person-1', 'Test Candidate')],
-    undefined,
-    () => revealResponse([enrichedCandidate('person-1', 'Test Candidate', { email: 'one@example-co.com', emailType: 'work' })])
-  );
-  fireEvent.click(screen.getByRole('checkbox', { name: /select test candidate/i }));
-  revealAndConfirm();
-  await detailsPanel('Test Candidate');
-
-  const revealCalls = () => calls.filter((call) => call.url === '/api/candidates/reveal').length;
-  expect(revealCalls()).toBe(1);
-
-  // Same candidate still selected: a second click is refused before it can
-  // even ask for confirmation, so no spend is ever offered.
-  fireEvent.click(revealButton());
-  await screen.findByText(/already has a revealed email/i);
-  expect(revealCalls()).toBe(1);
-});
-
-test('double-clicking reveal sends a single request', async () => {
-  let release;
-  const pending = new Promise((resolve) => { release = resolve; });
-  await searchWith(
-    [bareCandidate('person-1', 'Test Candidate')],
-    undefined,
-    async () => {
-      await pending;
-      return revealResponse([enrichedCandidate('person-1', 'Test Candidate', { email: 'one@example-co.com', emailType: 'work' })]);
-    }
-  );
-  fireEvent.click(screen.getByRole('checkbox', { name: /select test candidate/i }));
-
-  // With no confirmation in the way, the in-flight guard is the only thing
-  // between an impatient double-click and paying twice. The button relabels
-  // and disables the moment the first click lands, and further clicks on it
-  // must not reach Apollo.
-  fireEvent.click(revealButton());
-  const inFlight = screen.getByRole('button', { name: /^revealing email/i });
-  expect(inFlight.disabled).toBe(true);
-  fireEvent.click(inFlight);
-  fireEvent.click(inFlight);
-
-  await waitFor(() => expect(within(rowFor('Test Candidate')).getByText('Revealing contact details...')).toBeTruthy());
-  expect(calls.filter((call) => call.url === '/api/candidates/reveal').length).toBe(1);
-
-  release();
-  await waitFor(() => expect(within(rowFor('Test Candidate')).queryByText('Revealing contact details...')).toBeNull());
-  expect(calls.filter((call) => call.url === '/api/candidates/reveal').length).toBe(1);
-});
-
 test('a personal address is labelled as personal, not as a work address', async () => {
   await searchWith(
     [bareCandidate('person-1', 'Test Candidate')],
-    undefined,
-    () => revealResponse([enrichedCandidate('person-1', 'Test Candidate', { email: 'someone@gmail.com', emailType: 'personal' })])
+    () => ({
+      requestedIds: ['person-1'], failedIds: [], skippedIds: [],
+      candidates: [enrichedCandidate('person-1', 'Test Candidate', { email: 'someone@gmail.com', emailType: 'personal' })]
+    })
   );
   fireEvent.click(screen.getByRole('checkbox', { name: /select test candidate/i }));
-  revealAndConfirm();
+  fireEvent.click(screen.getByRole('button', { name: /^enrich selected/i }));
+  await screen.findByText(/enrichment complete/i);
 
   const panel = await detailsPanel('Test Candidate');
   expect(within(panel).getByText('Personal email')).toBeTruthy();
@@ -845,11 +702,13 @@ test('a personal address is labelled as personal, not as a work address', async 
 test('the frontend never receives or stores an Apollo key', async () => {
   await searchWith(
     [bareCandidate('person-1', 'Test Candidate')],
-    undefined,
-    () => revealResponse([enrichedCandidate('person-1', 'Test Candidate', { email: 'one@example-co.com', emailType: 'work' })])
+    () => ({
+      requestedIds: ['person-1'], failedIds: [], skippedIds: [],
+      candidates: [enrichedCandidate('person-1', 'Test Candidate', { email: 'one@example-co.com', emailType: 'work' })]
+    })
   );
   fireEvent.click(screen.getByRole('checkbox', { name: /select test candidate/i }));
-  revealAndConfirm();
+  fireEvent.click(screen.getByRole('button', { name: /^enrich selected/i }));
   await detailsPanel('Test Candidate');
 
   // The browser talks to our backend only, and sends no credentials of its own.
@@ -863,15 +722,18 @@ test('the frontend never receives or stores an Apollo key', async () => {
 test('shows the work address and the personal one when Apollo returns both', async () => {
   await searchWith(
     [bareCandidate('person-1', 'Test Candidate')],
-    undefined,
-    () => revealResponse([enrichedCandidate('person-1', 'Test Candidate', {
-      email: 'first.last@example-co.com',
-      emailType: 'work',
-      personalEmail: 'first.last.personal@gmail.com'
-    })])
+    () => ({
+      requestedIds: ['person-1'], failedIds: [], skippedIds: [],
+      candidates: [enrichedCandidate('person-1', 'Test Candidate', {
+        email: 'first.last@example-co.com',
+        emailType: 'work',
+        personalEmail: 'first.last.personal@gmail.com'
+      })]
+    })
   );
   fireEvent.click(screen.getByRole('checkbox', { name: /select test candidate/i }));
-  revealAndConfirm();
+  fireEvent.click(screen.getByRole('button', { name: /^enrich selected/i }));
+  await screen.findByText(/enrichment complete/i);
 
   const panel = await detailsPanel('Test Candidate');
   expect(within(panel).getByText('Work email')).toBeTruthy();
@@ -880,70 +742,6 @@ test('shows the work address and the personal one when Apollo returns both', asy
   const personal = within(panel).getByRole('link', { name: 'first.last.personal@gmail.com' });
   expect(personal.getAttribute('href')).toBe('mailto:first.last.personal@gmail.com');
 });
-
-test('a reveal that found no personal address says so, rather than nothing', async () => {
-  await searchWith(
-    [bareCandidate('person-1', 'Test Candidate')],
-    undefined,
-    () => revealResponse([enrichedCandidate('person-1', 'Test Candidate', {
-      email: 'first.last@example-co.com', emailType: 'work', personalEmail: null
-    })])
-  );
-  fireEvent.click(screen.getByRole('checkbox', { name: /select test candidate/i }));
-  revealAndConfirm();
-
-  const panel = await detailsPanel('Test Candidate');
-  expect(within(panel).getByText('Work email')).toBeTruthy();
-  // The credit was spent and the answer was "there isn't one". Hiding the row
-  // left the recruiter looking at the work address they already had, unable to
-  // tell an empty answer from a reveal that never ran.
-  expect(within(panel).getByText('Personal email')).toBeTruthy();
-  expect(within(panel).getByText(/apollo holds no personal email/i)).toBeTruthy();
-});
-
-
-
-test('a selection over the cap says how many will actually be charged', async () => {
-  const people = Array.from({ length: 14 }, (_, index) => bareCandidate(`person-${index}`, `Candidate ${index}`));
-  await searchWith(people, undefined, () => revealResponse([]));
-  selectEveryRow();
-  // 14 selected, but a reveal is capped at 10 to protect the account, and the
-  // button says so before it is pressed.
-  expect(revealButton().textContent).toMatch(/reveal email - 10 credits/i);
-});
-
-// --- Personal email filter --------------------------------------------------
-
-
-// Has Personal: revealed, Apollo gave a personal address.
-// Work Only:    revealed, Apollo gave none - a known negative.
-// Never Revealed: never asked, so unknown.
-async function revealTwo() {
-  await searchWith(
-    [bareCandidate('person-1', 'Has Personal'), bareCandidate('person-2', 'Work Only'), bareCandidate('person-3', 'Never Revealed')],
-    undefined,
-    () => revealResponse([
-      enrichedCandidate('person-1', 'Has Personal', {
-        email: 'has.personal@example-co.com', emailType: 'work', personalEmail: 'has.personal@gmail.com'
-      }),
-      enrichedCandidate('person-2', 'Work Only', {
-        email: 'work.only@example-co.com', emailType: 'work', personalEmail: null
-      })
-    ])
-  );
-  fireEvent.click(screen.getByRole('checkbox', { name: /select has personal/i }));
-  fireEvent.click(screen.getByRole('checkbox', { name: /select work only/i }));
-  revealAndConfirm();
-  await detailsPanel('Has Personal');
-}
-
-
-
-
-
-
-
-// --- Dev-server restart resilience ------------------------------------------
 
 test('a search retries once when the dev server was restarting', async () => {
   let attempts = 0;
@@ -978,68 +776,6 @@ test('a search that is still unreachable reports it rather than looping', async 
   await waitFor(() => expect(attempts).toBe(afterOpening + 4), { timeout: 8000 });
 }, 20000);
 
-test('a reveal never retries a dropped connection', async () => {
-  let attempts = 0;
-  await searchWith(
-    [bareCandidate('person-1', 'Test Candidate')],
-    undefined,
-    () => { attempts += 1; return proxyUnreachable(); }
-  );
-  fireEvent.click(screen.getByRole('checkbox', { name: /select test candidate/i }));
-  revealAndConfirm();
-
-  await screen.findByText(/candidate api is not running/i);
-  // A reset connection does not prove Apollo went unasked, so retrying could
-  // pay for the same candidate twice.
-  expect(attempts).toBe(1);
-  expect(calls.filter((call) => call.url === '/api/candidates/reveal').length).toBe(1);
-});
-
-
-
-test('an enriched candidate can still be revealed for a personal address', async () => {
-  // The trap this locks out: enriching first gives a work email, and a dedupe
-  // keyed on "has an email" would then refuse the reveal forever - making a
-  // personal address unreachable for anyone enriched first.
-  let revealCalls = 0;
-  await searchWith(
-    [bareCandidate('person-1', 'Test Candidate')],
-    () => ({
-      requestedIds: ['person-1'],
-      candidates: [enrichedCandidate('person-1', 'Test Candidate', {
-        email: 'work@example-co.com', emailType: 'work', personalEmail: null
-      })],
-      failedIds: [],
-      skippedIds: []
-    }),
-    () => {
-      revealCalls += 1;
-      return revealResponse([enrichedCandidate('person-1', 'Test Candidate', {
-        email: 'work@example-co.com', emailType: 'work', personalEmail: 'test.candidate@gmail.com'
-      })]);
-    }
-  );
-
-  fireEvent.click(screen.getByRole('checkbox', { name: /select test candidate/i }));
-  fireEvent.click(screen.getByRole('button', { name: /^enrich selected/i }));
-  await detailsPanel('Test Candidate');
-
-  // Now reveal the same candidate: it must reach Apollo, not be skipped.
-  revealAndConfirm();
-  await waitFor(() => expect(revealCalls).toBe(1));
-
-  const panel = await detailsPanel('Test Candidate');
-  expect(within(panel).getByText('Personal email')).toBeTruthy();
-  expect(within(panel).getByRole('link', { name: 'test.candidate@gmail.com' })).toBeTruthy();
-
-  // A second reveal is refused, because now it really has been asked.
-  fireEvent.click(revealButton());
-  await screen.findByText(/already has a revealed email/i);
-  expect(revealCalls).toBe(1);
-});
-
-// --- Not paying for candidates Apollo already ruled out ----------------------
-
 test('every search asks Apollo only for candidates it holds an address for', async () => {
   mockBackend({ search: () => searchResult([bareCandidate('person-1', 'Test Candidate')]) });
   render(<App />);
@@ -1065,100 +801,6 @@ test('every search asks Apollo only for candidates it holds an address for', asy
   expect(searchCalls()[1].body.verifiedEmailOnly).toBe(true);
 });
 
-
-test('a candidate Apollo has no address for is never charged for', async () => {
-  let revealCalls = 0;
-  await searchWith(
-    [{ ...bareCandidate('person-1', 'No Address'), hasEmailOnFile: false }],
-    undefined,
-    () => { revealCalls += 1; return revealResponse([]); }
-  );
-  fireEvent.click(screen.getByRole('checkbox', { name: /select no address/i }));
-  fireEvent.click(revealButton());
-
-  // Apollo said so in the free search response, so no confirmation is even
-  // offered and nothing is sent.
-  await screen.findByText(/apollo holds no email address for that candidate/i);
-  expect(revealCalls).toBe(0);
-});
-
-test('a mixed selection charges only for the candidates worth asking about', async () => {
-  await searchWith(
-    [
-      { ...bareCandidate('person-1', 'Has Address'), hasEmailOnFile: true },
-      { ...bareCandidate('person-2', 'No Address'), hasEmailOnFile: false }
-    ],
-    undefined,
-    () => revealResponse([enrichedCandidate('person-1', 'Has Address', { email: 'has@example-co.com', emailType: 'work' })])
-  );
-  selectEveryRow();
-  fireEvent.click(revealButton());
-
-  // Two selected, one charged.
-  await waitFor(() => expect(calls.some((call) => call.url === '/api/candidates/reveal')).toBe(true));
-  expect(calls.find((call) => call.url === '/api/candidates/reveal').body.ids).toEqual(['person-1']);
-  // And the one left out is still reported, alongside the result rather than
-  // in a dialog before it.
-  await screen.findByText(/1 selected candidate has no email on file/i);
-});
-
-// --- Waterfall: searching other data sources --------------------------------
-
-
-
-
-
-
-
-// --- The waterfall answer shape, end to end through the UI -------------------
-//
-// Apollo answers a waterfall with the person id and whatever the vendors
-// found, and nothing else. These drive the app with that real shape, mocked.
-
-
-// A found candidate is expanded automatically, and the details panel repeats
-// the contact fields the row already shows, so an assertion about one field has
-// to say which of the two it means.
-function identity(name) {
-  return rowFor(name).querySelector('.candidate-row .identity');
-}
-
-function contactCell(name) {
-  return rowFor(name).querySelector('.candidate-row .contact');
-}
-
-function contactLine(name, label) {
-  const lines = [...contactCell(name).querySelectorAll('.contact-line')];
-  return lines.find((line) => line.querySelector('.contact-label')?.textContent === label) || null;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// --- Narrowing a pool down to the right person ------------------------------
-//
-// Apollo requires every keyword to match, so each skill added narrows the pool
-// hard: measured against the live API, "python" returned 234, "python django"
-// returned 8 and "python django aws" returned 0. These lock in the behaviour
-// that makes that usable - separate terms, and the count for each query.
-
-function keywordBox() {
-  return screen.getByLabelText(/^skills$/i);
-}
 
 test('typing in the box hides nothing: the rows are what Apollo returned', async () => {
   // It used to filter the 25 rows in hand, which answered a question nobody
@@ -1596,7 +1238,7 @@ test('Apollo saying it has no number means no mobile credit is spent', async () 
 
 
 
-test('the Find personal emails button is gone from the toolbar', async () => {
+test('only the two actions that work are on the toolbar', async () => {
   // Removed because it could not work on this account: Apollo returned itself
   // as the only vendor, with no_apollo_data, so it re-asked the same database
   // that had already said no.
@@ -1607,8 +1249,11 @@ test('the Find personal emails button is gone from the toolbar', async () => {
   await screen.findByText('Test Candidate');
 
   expect(screen.queryByRole('button', { name: /find personal emails/i })).toBeNull();
-  // The three that do something are still there.
-  expect(screen.getByRole('button', { name: /^reveal email/i })).toBeTruthy();
+  // Reveal personal email went the same way, and for the same reason: measured
+  // against this account, Apollo held a personal address for none of the
+  // candidates it was spent on, while enrichment already returned the work one.
+  expect(screen.queryByRole('button', { name: /reveal personal email/i })).toBeNull();
+  // What is left is what actually returns something.
   expect(screen.getByRole('button', { name: /^reveal phone/i })).toBeTruthy();
   expect(screen.getByRole('button', { name: /^enrich selected/i })).toBeTruthy();
 });
@@ -1618,8 +1263,8 @@ test('nothing in the UI can start a waterfall search any more', async () => {
   // test rather than quietly hitting Apollo.
   mockBackend({
     search: () => searchResult([{ ...bareCandidate('person-1', 'Test Candidate'), hasEmailOnFile: true }]),
-    reveal: () => ({
-      requestedIds: ['person-1'], revealedPersonalEmails: true, failedIds: [], skippedIds: [],
+    enrich: () => ({
+      requestedIds: ['person-1'], failedIds: [], skippedIds: [],
       candidates: [enrichedCandidate('person-1', 'Test Candidate', { email: 'work@example-co.test', emailType: 'work' })]
     })
   });
@@ -1629,8 +1274,8 @@ test('nothing in the UI can start a waterfall search any more', async () => {
   await screen.findByText('Test Candidate');
 
   fireEvent.click(screen.getByRole('checkbox', { name: /select test candidate/i }));
-  fireEvent.click(screen.getByRole('button', { name: /^reveal email/i }));
-  await screen.findByText(/contact details requested for 1 candidate/i);
+  fireEvent.click(screen.getByRole('button', { name: /^enrich selected/i }));
+  await screen.findByText(/enrichment complete/i);
 
   expect(calls.some((call) => call.url === '/api/candidates/waterfall')).toBe(false);
 });
@@ -2056,8 +1701,8 @@ test('the personal email filter is gone; the address shows on the row instead', 
   // it belongs to, so the filter added a control without adding information.
   mockBackend({
     search: () => searchResult([{ ...bareCandidate('person-1', 'Has Personal'), hasEmailOnFile: true }]),
-    reveal: () => ({
-      requestedIds: ['person-1'], revealedPersonalEmails: true, failedIds: [], skippedIds: [],
+    enrich: () => ({
+      requestedIds: ['person-1'], failedIds: [], skippedIds: [],
       candidates: [enrichedCandidate('person-1', 'Has Personal', {
         email: 'work@example-co.test', emailType: 'work', personalEmail: 'found@example-mail.test'
       })]
@@ -2071,8 +1716,8 @@ test('the personal email filter is gone; the address shows on the row instead', 
   expect(screen.queryByRole('checkbox', { name: /personal email only/i })).toBeNull();
 
   fireEvent.click(screen.getByRole('checkbox', { name: /select has personal/i }));
-  fireEvent.click(screen.getByRole('button', { name: /^reveal email/i }));
-  await screen.findByText(/contact details requested for 1 candidate/i);
+  fireEvent.click(screen.getByRole('button', { name: /^enrich selected/i }));
+  await screen.findByText(/enrichment complete/i);
 
   // The address is on the row, which is what the filter was standing in for.
   const contact = rowFor('Has Personal').querySelector('.candidate-row .contact');
@@ -2321,4 +1966,69 @@ test('a slow earlier search cannot overwrite a faster later one', async () => {
     }
   });
   expect(screen.getByText(`Result of search ${newest.index}`)).toBeTruthy();
+});
+
+test('a pool filter clears the name filter it drops, in the state as well as the request', async () => {
+  // The search already dropped personName; the filters kept it. So the
+  // un-named pool showed under a `Named "X"` banner, and Next re-applied the
+  // name, making page 2 a different query than page 1.
+  // A total well past one page, so Next is enabled and page 2 can be compared.
+  mockBackend({
+    search: () => ({ candidates: [bareCandidate('person-1', 'Test Candidate')], page: 1, perPage: 25, total: 120 })
+  });
+  render(<App />);
+  fillRequired();
+  applySearch();
+  await screen.findByText('Test Candidate');
+
+  const nameBox = screen.getByLabelText(/find a candidate/i);
+  fireEvent.change(nameBox, { target: { value: 'Priya' } });
+  fireEvent.keyDown(nameBox, { key: 'Enter' });
+  await waitFor(() => expect(searchCalls().at(-1).body.personName).toBe('Priya'));
+
+  // Any pool filter now drops the name.
+  tickLocation('Hyderabad');
+  await waitFor(() => expect(searchCalls().at(-1).body.personName).toBe(''));
+
+  // Paging must not resurrect it: page 2 has to be the same query as page 1.
+  fireEvent.click(screen.getByRole('button', { name: /next/i }));
+  await waitFor(() => expect(searchCalls().at(-1).body.page).toBe(2));
+  expect(searchCalls().at(-1).body.personName).toBe('');
+});
+
+test('text left in the city search box is not committed by another filter', async () => {
+  // The Location box searches the city list. "Chen", typed to find Chennai, is
+  // a search term - committing it as a filter widened the pool, because Apollo
+  // ORs locations.
+  mockBackend({ search: () => searchResult([bareCandidate('person-1', 'Test Candidate')]) });
+  render(<App />);
+  fillRequired();
+  applySearch();
+  await screen.findByText('Test Candidate');
+
+  fireEvent.change(screen.getByLabelText(/search or add a city/i), { target: { value: 'Chen' } });
+  tickLocation('Chennai');
+
+  await waitFor(() => expect(searchCalls().at(-1).body.location).toBe('Chennai'));
+  expect(searchCalls().at(-1).body.location).not.toMatch(/Chen,|, Chen/);
+});
+
+test('the phone request carries the refresh flag the route reads', async () => {
+  // The route bypasses its cache on `refresh: true`; the client never sent the
+  // field at all, so that bypass was unreachable. (There is still no UI control
+  // that sets it - revealPhones() is only ever called bare - so this locks the
+  // plumbing, not a user-facing refresh.)
+  await phoneFlow([bareCandidate('person-1', 'Test Candidate')], {
+    phone: () => ({
+      requestedIds: ['person-1'], requests: [],
+      candidates: [phoneAnswer('person-1', { phone: '+1 555 0100 111' })],
+      failedIds: [], skippedIds: []
+    }),
+    poll: null
+  });
+  await screen.findByText(/found 1 phone number/i);
+
+  const sent = calls.filter((call) => call.url === '/api/candidates/phone').at(-1);
+  expect('refresh' in sent.body).toBe(true);
+  expect(sent.body.refresh).toBe(false);
 });

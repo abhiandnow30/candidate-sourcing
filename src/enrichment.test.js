@@ -2,8 +2,8 @@ import { describe, expect, test } from 'vitest';
 import {
   ENRICHED, ENRICHING, FAILED, NOT_ENRICHED, REVEALING,
   applyEnriched, applyStates, applyWaterfall, deliveryShortfall, deliveryShortfallMessage,
-  enrichmentLabel, enrichmentSummary, idsToEnrich, idsToReveal,
-  markState, mergeCandidate, reconcile, revealSummary, stateOf
+  enrichmentLabel, enrichmentSummary, idsToEnrich,
+  markState, mergeCandidate, reconcile, stateOf
 } from './enrichment.js';
 
 const states = (entries) => new Map(entries);
@@ -139,56 +139,6 @@ describe('enrichmentSummary', () => {
     expect(enrichmentSummary({ matched: 4, failed: 1, skipped: 0 })).toContain('Unable to enrich this candidate.');
     expect(enrichmentSummary({ matched: 25, failed: 0, skipped: 5 })).toContain('per-request limit');
   });
-});
-
-test('a reveal skips candidates whose address we already hold', () => {
-  const states = new Map([['p1', ENRICHED], ['p2', ENRICHED]]);
-  const revealed = new Map([
-    ['p1', { id: 'p1', email: 'work@example-co.com', contactRevealed: true }],
-    ['p2', { id: 'p2', email: null, contactRevealed: true }]
-  ]);
-
-  // p1 is already paid for; p2 was revealed too, and Apollo had nothing.
-  expect(idsToReveal(['p1', 'p2'], states, revealed)).toEqual([]);
-
-  // Enriched but never revealed: holds a work address, yet Apollo has not been
-  // asked for contact data, so paying to ask is still allowed.
-  const enrichedOnly = new Map([['p1', { id: 'p1', email: 'work@example-co.com' }]]);
-  expect(idsToReveal(['p1'], states, enrichedOnly)).toEqual(['p1']);
-
-  // An explicit refresh overrides the guard.
-  expect(idsToReveal(['p1', 'p2'], states, revealed, { refresh: true })).toEqual(['p1', 'p2']);
-
-  // Anything already in flight is never sent twice, refresh or not.
-  const inFlight = new Map([['p1', REVEALING], ['p2', ENRICHING]]);
-  expect(idsToReveal(['p1', 'p2'], inFlight, new Map(), { refresh: true })).toEqual([]);
-
-  // Unknown candidates are eligible; empty IDs never are.
-  expect(idsToReveal(['p3', '', null], new Map(), new Map())).toEqual(['p3']);
-});
-
-test('the reveal summary says whether a PERSONAL address was found', () => {
-  const outcome = (candidates) => reconcile(candidates.map((c) => c.requestedId), { candidates, skippedIds: [] });
-
-  // A work address only: useful, but not what the recruiter asked for.
-  expect(revealSummary(outcome([
-    { requestedId: 'p1', id: 'p1', email: 'work@example-co.com', emailType: 'work', personalEmail: null }
-  ]))).toMatch(/1 work address found, but Apollo holds no personal email for this candidate/i);
-
-  // A personal address alongside the work one.
-  expect(revealSummary(outcome([
-    { requestedId: 'p1', id: 'p1', email: 'work@example-co.com', emailType: 'work', personalEmail: 'p@gmail.com' }
-  ]))).toMatch(/1 personal email found, and 1 work address/i);
-
-  // Personal only, carried in the primary slot.
-  expect(revealSummary(outcome([
-    { requestedId: 'p1', id: 'p1', email: 'p@gmail.com', emailType: 'personal', personalEmail: null }
-  ]))).toMatch(/1 personal email found/i);
-
-  // Nothing at all.
-  expect(revealSummary(outcome([
-    { requestedId: 'p1', id: 'p1', email: null, emailType: null, personalEmail: null }
-  ]))).toMatch(/Apollo returned no email address/i);
 });
 
 // --- Merging a waterfall answer into the row it answers ----------------------

@@ -44,23 +44,6 @@ export function idsToEnrich(ids, states, { refresh = false } = {}) {
   });
 }
 
-// Which selected IDs a reveal actually sends to Apollo. Every reveal spends
-// credits, so a candidate Apollo has already been asked about is not paid for
-// twice unless the recruiter explicitly refreshes.
-//
-// The test is contactRevealed, not "has an email". A candidate enriched earlier
-// holds a work address, but nobody ever asked Apollo for their contact data, so
-// they must stay eligible - otherwise enriching first would permanently block
-// the reveal that is the only way to get a personal address. Work already in
-// flight is never sent twice.
-export function idsToReveal(ids, states, revealed = new Map(), { refresh = false } = {}) {
-  return ids.filter((id) => {
-    if (!id || IN_FLIGHT.has(stateOf(states, id))) return false;
-    if (refresh) return true;
-    return !revealed.get(id)?.contactRevealed;
-  });
-}
-
 // Which selected IDs a phone reveal sends to Apollo. Mobile credits are the
 // dearest thing this app spends, so a candidate whose number is already in hand
 // is never paid for twice, and one Apollo has already answered "none" for is not
@@ -251,26 +234,6 @@ export function deliveryShortfallMessage(jobs, { kind = 'email' } = {}) {
 export function withoutAnswerFlags(candidate) {
   const { phoneChecked, waterfallChecked, contactRevealed, ...rest } = candidate || {};
   return rest;
-}
-
-// Reveal reports on addresses, not just matches: a candidate Apollo matched but
-// has no email for is a real, useful outcome and must not read as a failure.
-export function revealSummary(outcome) {
-  const { matched, failed, skipped } = outcome;
-  const revealed = [...outcome.candidatesByKey.values()];
-  const withEmail = revealed.filter((candidate) => candidate.email).length;
-  // Reported separately because it is the whole point of a reveal for a
-  // recruiter: "an address was found" is not news if it is the work one they
-  // could already see.
-  const withPersonal = revealed.filter((candidate) => candidate.personalEmail || candidate.emailType === 'personal').length;
-
-  const parts = [`Contact details requested for ${matched} candidate${matched === 1 ? '' : 's'}.`];
-  if (!withEmail) parts.push('Apollo returned no email address for these candidates.');
-  else if (withPersonal) parts.push(`${withPersonal} personal email${withPersonal === 1 ? '' : 's'} found, and ${withEmail} work address${withEmail === 1 ? '' : 'es'}.`);
-  else parts.push(`${withEmail} work address${withEmail === 1 ? '' : 'es'} found, but Apollo holds no personal email for ${matched === 1 ? 'this candidate' : 'any of them'}.`);
-  if (failed) parts.push(`${failed} could not be matched.`);
-  if (skipped) parts.push(`${skipped} candidate${skipped === 1 ? '' : 's'} were not sent because of the per-request limit. Reveal them in a second batch.`);
-  return parts.join(' ');
 }
 
 export function enrichmentSummary({ matched, failed, skipped }) {

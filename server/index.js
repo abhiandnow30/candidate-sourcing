@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { enrichPeople, matchPerson, normalizeWaterfallCandidate, pollWaterfallResult, requestPhoneNumbers, requestWaterfallEmails, searchPeople, splitList } from './apolloService.js';
+import { enrichPeople, matchPerson, normalizeWaterfallCandidate, pollWaterfallResult, requestPhoneNumbers, requestWaterfallEmails, searchPeople } from './apolloService.js';
 import { NEEDS_ENRICHED, NEEDS_PHONE, NEEDS_REVEALED, readCached, saveCandidates, stated } from './store.js';
 
 // Credit guard: the most people one /enrich call will forward to Apollo.

@@ -104,14 +104,36 @@ The results table has six columns: select, Candidate, Company, Location, Contact
 
 A successful enrichment opens the details panel automatically, since the recruiter just asked for that data.
 
-### The two spending actions
+### The one spending action
 
-Search and enrichment never spend contact credits. Two buttons do, each reached only from an explicit click, each showing what it would cost before it is pressed:
+Search and enrichment return what Apollo already holds. One button spends a contact credit beyond that, reached only from an explicit click, showing what it would cost before it is pressed:
 
-| Action | Spends | Runs |
-|---|---|---|
-| **Reveal email** | Apollo contact credit per candidate | Immediately |
-| **Reveal phone** | Mobile credit per candidate — the dearest | Asynchronously, minutes |
+| Action | Adds | Spends | Runs |
+|---|---|---|---|
+| **Reveal phone** | A direct number | Mobile credit per candidate | Asynchronously, minutes |
+
+**Enrich returns the work email.** That is the normal path to a candidate's address, and for most work it is the whole workflow.
+
+### Why there is no "reveal personal email" button
+
+It was in the toolbar and on each row, and was removed on 2026-09-15.
+
+`/enrich` and `/reveal` are the same Apollo `bulk_match` call through the same handler. The only difference is one flag:
+
+```js
+reveal_personal_emails: revealPersonalEmails === true
+```
+
+So enrichment already returned the work address, and reveal bought exactly one extra field: the personal address. Measured against this account, it never produced one — three candidates were paid for and Apollo held a personal email for none of them, the same three the waterfall then failed to help with.
+
+That leaves a button whose visible effect was identical to enrichment's, at the price of a contact credit. The name made it worse: "Reveal email" read as a second attempt at an address the recruiter could already see.
+
+Two things worth knowing if it is ever revisited:
+
+- **There is no free signal for a *personal* address.** `hasEmailOnFile` — which powers the guard that skips candidates Apollo cannot help with — covers *any* email, so it is usually `true` because of the work address. Reveal was therefore a gamble on every candidate, with no way to spend it only where it might pay off.
+- **One case is genuinely unserved now:** a candidate for whom Apollo holds *only* a personal address would return no email from `/enrich` at all. None appeared in testing, but the row-level button — which only ever showed when a row had no address — was the path for it.
+
+`POST /api/candidates/reveal` still exists and is still tested; only the UI was removed.
 
 ### Why there is no "search other sources" button
 

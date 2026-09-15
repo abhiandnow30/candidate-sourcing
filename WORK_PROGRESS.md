@@ -5,6 +5,35 @@ Newest entry first. Branch: `dev-branch`.
 
 ---
 
+## 2026-09-15 — In progress (uncommitted)
+
+**Reveal personal email removed from the UI**, after the same kind of live
+measurement that removed the waterfall button two days earlier.
+
+- **Why.** `/enrich` and `/reveal` are the same Apollo `bulk_match` call through
+  the same handler, differing only in `reveal_personal_emails`. Enrichment
+  already returns the work address, so reveal bought exactly one extra field —
+  and against this account it never produced one: 3 reveals paid for, 0 personal
+  emails returned, checked against the candidate store.
+- **The name made it look redundant when it was merely useless.** It was first
+  relabelled "Reveal personal email" (from "Reveal email") so the distinction was
+  visible at all, then removed once the hit rate was clear.
+- **No free signal to aim it.** `hasEmailOnFile` covers *any* email, so it is
+  normally true because of the work address. There was no way to spend the
+  credit only where a personal address might exist.
+- **Removed:** both buttons, `reveal()`, `emailCost`, `REVEAL_LIMIT`, the
+  `onReveal` plumbing, `idsToReveal`, `revealSummary`, and 12 reveal-specific
+  tests. 6 further tests that used reveal only as a vehicle for display logic
+  were moved onto the enrich path rather than deleted, so the personal-address
+  rendering stays covered.
+- **Kept:** `POST /api/candidates/reveal`, untouched and still tested.
+- **One case now unserved:** a candidate for whom Apollo holds *only* a personal
+  address returns no email from `/enrich`. None appeared in testing; the
+  row-level button, which showed only when a row had no address at all, was the
+  path for it.
+
+250 passing (125 server, 125 UI).
+
 ## 2026-09-13 — In progress (uncommitted)
 
 Webhook delivery-failure handling and configuration docs. Keeps the Cloudflare

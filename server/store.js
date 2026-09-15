@@ -44,9 +44,21 @@ export function present(value) {
   return Array.isArray(value) ? value.length > 0 : true;
 }
 
+// The fields where `false` is Apollo's own assertion rather than an absence.
+//
+// Everywhere else a `false` on a sparse answer means "this record does not
+// speak to that", so it must not overwrite. These two are tri-state - `null` is
+// the unknown - so `false` is a statement, and it has to be allowed to correct
+// a stored `true`. Without this a stale `hasPhoneOnFile: true` survives every
+// later search, and the client's credit guard (`hasPhoneOnFile !== false`) then
+// spends a mobile credit on somebody Apollo has just said it holds no number
+// for - the dearest thing this app can get wrong.
+const ASSERTED_WHEN_FALSE = new Set(['hasEmailOnFile', 'hasPhoneOnFile']);
+
 // Only the fields an answer actually states, for merging over a stored record.
 export function stated(candidate) {
-  return Object.fromEntries(Object.entries(candidate).filter(([, value]) => present(value)));
+  return Object.fromEntries(Object.entries(candidate)
+    .filter(([key, value]) => present(value) || (value === false && ASSERTED_WHEN_FALSE.has(key))));
 }
 
 export const NEEDS_ENRICHED = 'enriched_at';
@@ -114,7 +126,16 @@ export function readCached(ids, need) {
 // look like a revealed email.
 export function saveCandidates(candidates, marks = {}) {
   if (cacheDisabled()) return;
-  const usable = candidates.filter((candidate) => candidate && typeof candidate.id === 'string' && candidate.id !== '');
+  // Keyed by the id the client asked about, never the canonical one Apollo may
+  // echo back in its place. `requestedId` exists precisely because those differ,
+  // and `readCached` looks rows up by what the client sent - so a row written
+  // under Apollo's id was stored where nothing would ever look for it, and the
+  // candidate was paid for again on every future request.
+  const keyOf = (candidate) => {
+    const key = candidate.requestedId || candidate.id;
+    return typeof key === 'string' && key !== '' ? key : null;
+  };
+  const usable = candidates.filter((candidate) => candidate && keyOf(candidate));
   if (!usable.length) return;
   const now = Date.now();
   const database = connection();
@@ -132,8 +153,9 @@ export function saveCandidates(candidates, marks = {}) {
       phone_at = COALESCE(excluded.phone_at, candidates.phone_at)
   `);
   for (const candidate of usable) {
+    const key = keyOf(candidate);
     let merged = candidate;
-    const existing = read.get(candidate.id);
+    const existing = read.get(key);
     if (existing?.data) {
       try {
         const previous = JSON.parse(existing.data);
@@ -144,7 +166,7 @@ export function saveCandidates(candidates, marks = {}) {
     // it is never written.
     const { fromCache, ...stored } = merged;
     write.run(
-      candidate.id,
+      key,
       JSON.stringify(stored),
       marks.enriched ? now : null,
       marks.revealed ? now : null,

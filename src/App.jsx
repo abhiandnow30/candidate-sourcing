@@ -2,8 +2,8 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   ENRICHED, ENRICHING, FAILED, NOT_ENRICHED, REVEALING, REVEALING_PHONE,
   applyEnriched, applyStates, applyWaterfall, deliveryShortfall, deliveryShortfallMessage,
-  enrichmentLabel, enrichmentSummary, idsToEnrich, idsToReveal,
-  idsToRevealPhone, markState, mergeCandidate, reconcile, revealSummary, stateOf, withoutAnswerFlags
+  enrichmentLabel, enrichmentSummary, idsToEnrich,
+  idsToRevealPhone, markState, mergeCandidate, reconcile, stateOf, withoutAnswerFlags
 } from './enrichment.js';
 
 // personName is not one of the form fields: it is driven by the results search
@@ -17,6 +17,17 @@ const initialFilters = { jobTitle: '', location: '', seniority: '', keywords: ''
 // Fields holding a comma-separated list, shown as removable chips so the search
 // reads as a list rather than as punctuation.
 const MULTI_VALUE_FIELDS = ['keywords', 'location'];
+// Which half-typed boxes a filter change *elsewhere* may commit on the
+// recruiter's behalf. A skill typed but never entered is plainly meant to be
+// searched on, so it goes in.
+//
+// Location does not. Its box searches the city list as you type - the cities
+// themselves are ticked - so text sitting in it is a search term, not a filter.
+// Committing it when some other control fired turned "Chen", typed to find
+// Chennai, into a location filter of its own; Apollo ORs locations, so that
+// widened the pool instead of narrowing it and left a bogus chip behind.
+// Enter in that box still commits it, through commitDraft below.
+const INCIDENTAL_DRAFT_FIELDS = ['keywords'];
 const NO_DRAFTS = { keywords: '', location: '' };
 
 // Apollo has no facet endpoint, and - measured against the live API - it
@@ -136,9 +147,6 @@ const COMMON_SKILLS = ['python', 'java', 'sql', 'aws', 'machine learning', 'test
 
 const NOT_AVAILABLE = 'Not available';
 const DEFAULT_PER_PAGE = 25;
-// Mirrors MAX_REVEAL_PER_REQUEST on the backend, so the confirmation can state
-// the real cost instead of a number the server will then cut down.
-const REVEAL_LIMIT = 10;
 // Mirrors MAX_PHONE_PER_REQUEST on the backend. Mobile credits are the dearest
 // thing this app spends, so the confirmation can state the real cost rather
 // than a number the server will then cut down.
@@ -279,7 +287,7 @@ function ContactLine({ label, children }) {
   return <div className="contact-line"><span className="contact-label">{label}</span>{children}</div>;
 }
 
-function EnrichedDetails({ candidate, onRefresh, onReveal, busy, revealing, state }) {
+function EnrichedDetails({ candidate, onRefresh, busy, revealing, state }) {
   const history = candidate.employmentHistory || [];
   const current = history.filter((role) => role.current);
   const previous = history.filter((role) => !role.current);
@@ -289,11 +297,6 @@ function EnrichedDetails({ candidate, onRefresh, onReveal, busy, revealing, stat
     <div className="enriched-head">
       <h4>Enriched Details</h4>
       <div className="enriched-actions">
-        {/* Spends extra Apollo credits, so it is never automatic: the recruiter
-            asks for it on the candidate whose email they can see is missing. */}
-        {!candidate.email && <button type="button" className="link-button" onClick={onReveal} disabled={busy}>
-          {revealing ? 'Revealing email...' : 'Reveal email address'}
-        </button>}
         <button type="button" className="link-button" onClick={onRefresh} disabled={busy}>
           {busy && !revealing ? 'Refreshing...' : 'Refresh from Apollo'}
         </button>
@@ -323,7 +326,7 @@ function EnrichedDetails({ candidate, onRefresh, onReveal, busy, revealing, stat
   </section>;
 }
 
-function CandidateBlock({ candidate, selected, selectable, state, expanded, busy, onToggle, onExpand, onRetry, onRefresh, onReveal }) {
+function CandidateBlock({ candidate, selected, selectable, state, expanded, busy, onToggle, onExpand, onRetry, onRefresh }) {
   const name = valueOrUnavailable(candidate.name);
   // The whole row is the checkbox: selecting people is what this table is for,
   // and hunting a 15px box for every one of 25 rows was the slowest thing on
@@ -386,7 +389,6 @@ function CandidateBlock({ candidate, selected, selectable, state, expanded, busy
       && <EnrichedDetails
         candidate={candidate}
         onRefresh={onRefresh}
-        onReveal={onReveal}
         busy={busy}
         revealing={state === REVEALING}
         state={state}
@@ -461,19 +463,23 @@ export default function App() {
   // The new filters are passed to search() as overrides because React has not
   // re-rendered yet, so reading them back off state here would send the
   // previous value.
-  function applyFilters(next, pending = drafts) {
+  function applyFilters(next, pending = drafts, fields = INCIDENTAL_DRAFT_FIELDS) {
     // Whatever is still in a box joins the filters it was typed beside: a skill
     // typed but never entered is one the recruiter plainly meant to search on,
-    // so it is committed here rather than quietly dropped.
+    // so it is committed here rather than quietly dropped. `fields` says which
+    // boxes that applies to - see INCIDENTAL_DRAFT_FIELDS.
     const merged = { ...next };
-    for (const field of MULTI_VALUE_FIELDS) {
+    for (const field of fields) {
       const draft = (pending[field] || '').trim();
       if (draft) merged[field] = splitList(`${merged[field]}, ${draft}`).join(', ');
     }
-    setFilters(merged);
-    setDrafts(NO_DRAFTS);
     // A name filter describes one person and these filters describe a pool, so
     // committing a pool filter drops it rather than silently ANDing the two.
+    // It is cleared from the filters as well as from the search: leaving it set
+    // showed the un-named pool under a `Named "X"` banner, and made Next re-apply
+    // the name, so page 2 answered a different query than page 1.
+    setFilters({ ...merged, personName: '' });
+    setDrafts(NO_DRAFTS);
     setRowQuery('');
     search(1, { ...merged, personName: '' });
   }
@@ -493,8 +499,11 @@ export default function App() {
 
   // Enter in a box: commit whatever is in it - in either box - and search on
   // the result.
+  // Enter in a filter box: an explicit commit, so every box's draft counts -
+  // including Location, which is the only way to add a city the list does not
+  // already offer.
   function commitDraft() {
-    applyFilters({ ...filters });
+    applyFilters({ ...filters }, drafts, MULTI_VALUE_FIELDS);
   }
 
   // A value picked from the list, which replaces whatever was half-typed in
@@ -759,6 +768,10 @@ export default function App() {
   function toggleMatchAllSkills() {
     const next = !matchAllSkills;
     setMatchAllSkills(next);
+    // Same reason as applyFilters: this searches the pool, so the name filter is
+    // dropped from the state it is displayed from, not only from the request.
+    setFilters((previous) => ({ ...previous, personName: '' }));
+    setRowQuery('');
     search(1, { personName: '' }, next);
   }
 
@@ -812,43 +825,6 @@ export default function App() {
     });
   }
 
-  // The only path in the app that spends Apollo's contact credits. Reached
-  // from an explicit click, never from search and never from plain enrichment.
-  // This step only works out what would be sent and asks; nothing reaches
-  // Apollo until the recruiter confirms the cost below.
-  function reveal(explicitIds, { refresh = false } = {}) {
-    const ids = explicitIds || [...selected];
-    // Every reveal costs credits, so anyone whose address we already hold is
-    // dropped here rather than paid for again.
-    const eligible = idsToReveal(ids, states, enriched, { refresh });
-    // Apollo told us in the free search response that it holds no address for
-    // these. Revealing them can only return nothing, so they are never charged
-    // for, and the recruiter is told rather than left guessing.
-    const byId = new Map(shownList().map((candidate) => [candidate.requestedId || candidate.id, candidate]));
-    const requested = eligible.filter((id) => byId.get(id)?.hasEmailOnFile !== false);
-    const noAddressOnFile = eligible.length - requested.length;
-
-    if (!requested.length) {
-      return setStatus({
-        type: 'info',
-        text: noAddressOnFile
-          ? `Apollo holds no email address for ${noAddressOnFile === 1 ? 'that candidate' : `those ${noAddressOnFile} candidates`}, so revealing would return nothing and no credit was spent.`
-          : ids.length
-            ? 'Every selected candidate already has a revealed email. Use Refresh from Apollo to fetch it again.'
-            : 'Select at least one candidate to reveal contact details for.'
-      });
-    }
-    // Sent on the click that asked for it. The cost is on the button, so a
-    // second click would only have repeated what was already on screen.
-    return runEnrichment({
-      path: '/api/candidates/reveal', requested, busyKey: 'reveal', inFlightState: REVEALING,
-      summarize: revealSummary, failureText: 'Unable to reveal contact details.', restoreOnError: true, refresh,
-      notice: noAddressOnFile
-        ? `${noAddressOnFile} selected candidate${noAddressOnFile === 1 ? ' has' : 's have'} no email on file at Apollo and ${noAddressOnFile === 1 ? 'was' : 'were'} left out, so no credit is wasted on ${noAddressOnFile === 1 ? 'it' : 'them'}.`
-        : ''
-    });
-  }
-
   // Asks Apollo for phone numbers. The dearest thing this app can spend, so it
   // works out who would actually be charged for and then asks; nothing reaches
   // Apollo until the recruiter confirms below.
@@ -885,12 +861,12 @@ export default function App() {
     }
     return runPhoneReveal(eligible.slice(0, PHONE_LIMIT), noneOnFile
       ? `${noneOnFile} selected candidate${noneOnFile === 1 ? ' has' : 's have'} no phone number on file at Apollo and ${noneOnFile === 1 ? 'was' : 'were'} left out, so no credit is wasted on ${noneOnFile === 1 ? 'it' : 'them'}.`
-      : '');
+      : '', refresh);
   }
 
   // Sends the phone request. Separate from the confirmation above so the email
   // reveal can run it as part of the same confirmed action.
-  async function runPhoneReveal(requested, notice = '') {
+  async function runPhoneReveal(requested, notice = '', refresh = false) {
     if (!requested.length) return;
 
     // A phone reveal does not enrich anybody: it asks one question and answers
@@ -902,7 +878,10 @@ export default function App() {
     setLoading('phone'); setStatus(null);
     try {
       const data = await readJson(await fetch('/api/candidates/phone', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: requested })
+        // refresh is forwarded: without it the route's cache bypass was
+        // unreachable, so a stale stored number could never be bought again and
+        // "Found 1 phone number" was reported over the same old value.
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: requested, refresh })
       }));
 
       // Whatever Apollo already held arrives at once; show it rather than
@@ -1109,7 +1088,6 @@ export default function App() {
     .filter((role) => !typedRole || rolePicked || role.toLowerCase().includes(typedRole));
 
   const selectedIds = [...selected];
-  const emailCost = Math.min(idsToReveal(selectedIds, states, enriched).length, REVEAL_LIMIT);
   const phoneIds = phoneWorthAsking(selectedIds).slice(0, PHONE_LIMIT);
   const phoneConfirmed = phoneIds.filter((id) => {
     const known = candidates.find((candidate) => (candidate.requestedId || candidate.id) === id);
@@ -1125,8 +1103,6 @@ export default function App() {
   const nameNarrowedBy = activeFilterLabels.filter((label) => label !== 'location')
     .join(', ').replace(/, ([^,]*)$/, ' and $1');
   const skillTotals = lastSkillTotals;
-  const anyFilterApplied = ['jobTitle', 'location', 'keywords', 'seniority']
-    .some((key) => filters[key].trim() !== '');
   // How big the pool is, stated once. Apollo gives no single total for a union
   // of several skill searches, so that case says what it can rather than
   // inventing a number.
@@ -1333,11 +1309,6 @@ export default function App() {
           <div className="selection-actions">
             <span>Selected: <b>{selected.size}</b></span>
             <button type="button" onClick={clearSelection} disabled={!selected.size}>Clear</button>
-            <button type="button" className="reveal" onClick={() => reveal()} disabled={!selected.size || Boolean(loading)}>
-              {loading === 'reveal'
-                ? 'Revealing email...'
-                : `Reveal email${emailCost ? ` - ${emailCost} credit${emailCost === 1 ? '' : 's'}` : ''}`}
-            </button>
             <button type="button" className="reveal" onClick={() => revealPhones()} disabled={!selected.size || Boolean(loading)}>
               {loading === 'phone'
                 ? 'Revealing phone...'
@@ -1456,7 +1427,6 @@ export default function App() {
               onExpand={() => toggleExpanded(id)}
               onRetry={() => enrich([id], { refresh: true })}
               onRefresh={() => enrich([id], { refresh: true })}
-              onReveal={() => reveal([id])}
             />;
           })}
         </div>}

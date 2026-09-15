@@ -1112,3 +1112,38 @@ test('stated() keeps only the fields an answer really makes a claim about', asyn
     { a: 'x', b: 1, c: true, i: ['v'] }
   );
 });
+
+test('Apollo answering under a different canonical id still caches under the id we asked for', async () => {
+  // normalizeCandidate keeps `requestedId` precisely because Apollo may echo a
+  // different canonical id. Keying the row on Apollo's id stored it where
+  // readCached would never look, so the candidate was paid for again every time.
+  const { saveCandidates, readCached, NEEDS_ENRICHED, clearCache } = await import('./store.js');
+  clearCache();
+
+  saveCandidates([{
+    id: 'apollo-canonical-1', requestedId: 'person-1',
+    name: 'Test Candidate', email: 'work@example-co.test'
+  }], { enriched: true });
+
+  const held = readCached(['person-1'], NEEDS_ENRICHED);
+  assert.equal(held.has('person-1'), true, 'found under the id the client asked about');
+  assert.equal(held.get('person-1').name, 'Test Candidate');
+});
+
+test('Apollo saying it holds no number corrects a stored yes', async () => {
+  // hasPhoneOnFile is tri-state: null is unknown, false is Apollo's own
+  // statement. Dropping that false left a stale true in the cache, and the
+  // client's guard (hasPhoneOnFile !== false) then spent a mobile credit on
+  // somebody Apollo had just said it holds no number for.
+  const { saveCandidates, readCached, NEEDS_ENRICHED, clearCache } = await import('./store.js');
+  clearCache();
+
+  saveCandidates([{ id: 'person-1', name: 'Test Candidate', hasPhoneOnFile: true, hasEmailOnFile: true }], { enriched: true });
+  saveCandidates([{ id: 'person-1', name: null, hasPhoneOnFile: false, hasEmailOnFile: false, emailAvailable: false, skills: [] }], { enriched: true });
+
+  const held = readCached(['person-1'], NEEDS_ENRICHED).get('person-1');
+  assert.equal(held.hasPhoneOnFile, false, 'Apollo said no, and that must stick');
+  assert.equal(held.hasEmailOnFile, false);
+  // The derived flags are still absences on a sparse answer, not corrections.
+  assert.equal(held.name, 'Test Candidate');
+});
